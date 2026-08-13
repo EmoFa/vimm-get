@@ -150,8 +150,13 @@ class Hub:
         self._pages: dict[int, object] = {}   # vault_id -> VaultPage
         self._opts = None
 
+        # Entry keys currently being driven through every stage by Convert
+        # All. Kept off the entry itself so it never reaches history.json.
+        self._chaining: set[str] = set()
+
         self.pipeline = PipelineWorker(on_event=self._on_job_event)
         self.search_session = search_mod.make_session()
+        self.reconcile_history()
 
         # Background resolver: fills in title/system/discs for queued items
         # so the disc picker and the per-system buttons work before any
@@ -364,9 +369,16 @@ class Hub:
     # -------------------------------------------------------------- history
 
     def can_chd(self, entry: dict) -> bool:
+        """Whether the COMPRESS action is offerable right now.
+
+        Includes "not already done", so the flag alone decides the button and
+        callers cannot disagree about what it means.
+        """
         systems = [s.lower() for s in self.settings.get("chd_systems", [])]
+        stages = entry.get("stages", {})
         return (entry.get("system_folder", "").lower() in systems
-                and bool(entry.get("stages", {}).get("extracted")))
+                and bool(stages.get("extracted"))
+                and not stages.get("chd"))
 
     def can_m3u(self, entry: dict) -> bool:
         """Playlists come last: the discs have to be compressed first, so the
@@ -376,7 +388,8 @@ class Hub:
         stages = entry.get("stages", {})
         return (entry.get("system_folder", "").lower() in systems
                 and len(entry.get("files", [])) > 1
-                and bool(stages.get("chd")))
+                and bool(stages.get("chd"))
+                and not stages.get("m3u"))
 
     def decorate(self, entry: dict) -> dict:
         """Entry plus the flags the UI needs to decide which buttons exist."""
@@ -433,6 +446,50 @@ class Hub:
 
     # ------------------------------------------------------ pipeline chain
 
+    # ------------------------------------------------- which files are ours
+
+    def entry_files(self, entry: dict) -> list[Path]:
+        """The files on disk that belong to this game.
+
+        `entry["dir"]` is the *system* folder, shared with every other game on
+        that system, so per-game work must never scan it. Extraction records
+        what it produced; that list is the authoritative answer and survives
+        the flatten step renaming files.
+        """
+        tracked = entry.get("files_on_disk")
+        if tracked:
+            return [Path(p) for p in tracked if Path(p).is_file()]
+        return self._guess_entry_files(entry)
+
+    @staticmethod
+    def _guess_entry_files(entry: dict) -> list[Path]:
+        """Best effort for entries recorded before file tracking existed:
+        match on the archive's stem. Returns nothing rather than guessing
+        wildly, so a caller refuses instead of touching the whole folder."""
+        folder = Path(entry.get("dir", ""))
+        stems = [Path(f["archive"]).stem for f in entry.get("files", [])
+                 if f.get("archive")]
+        if not folder.is_dir() or not stems:
+            return []
+        return [path for path in sorted(folder.iterdir())
+                if path.is_file() and any(path.stem.startswith(s) for s in stems)]
+
+    def track_files(self, entry: dict, paths) -> None:
+        """Record files as belonging to this game, dropping any now gone."""
+        tracked = list(entry.get("files_on_disk") or [])
+        for path in paths:
+            text = str(path)
+            if text not in tracked:
+                tracked.append(text)
+        entry["files_on_disk"] = [p for p in tracked if Path(p).is_file()]
+
+    def _already_compressed(self, entry: dict) -> bool:
+        files = self.entry_files(entry)
+        return (bool(files) and any(p.suffix.lower() == ".chd" for p in files)
+                and not chd_mod.compressible_among(files))
+
+    # ------------------------------------------------------------- stages
+
     def submit_stage(self, entry: dict, kind: str) -> Job | None:
         item_dir = Path(entry["dir"])
         if kind == "extract":
@@ -441,38 +498,108 @@ class Hub:
             if not archives:
                 self.log(f"! nothing to extract for {entry['title']}")
                 return None
-            job = None
+            submitted = None
             for archive in archives:
-                job = self.pipeline.submit(Job(
+                submitted = self.pipeline.submit(Job(
                     kind="extract", label=archive.name, target=archive,
-                    item_key=entry["key"]))
-            return job
+                    item_key=entry["key"])) or submitted
+            return submitted
         if kind == "chd":
             if not self.can_chd(entry):
                 self.log(f"! CHD is not applicable to {entry['title']}")
                 return None
-            sheets = chd_mod.compressible_sheets(item_dir)
+            sheets = chd_mod.compressible_among(self.entry_files(entry))
             if not sheets:
-                self.log(f"! no .cue/.gdi to compress for {entry['title']}")
+                # Nothing left to do. If the discs are already .chd the flag
+                # was simply stale, so correct it rather than leaving a button
+                # that can never accomplish anything.
+                if self._already_compressed(entry):
+                    self._mark_stage(entry, "chd")
+                    self.log(f"{entry['title']} was already compressed")
+                else:
+                    self.log(f"! no .cue/.gdi to compress for {entry['title']}")
                 return None
-            job = None
+            submitted = None
             for sheet in sheets:
-                job = self.pipeline.submit(Job(
+                submitted = self.pipeline.submit(Job(
                     kind="chd", label=sheet.name, target=sheet,
                     item_key=entry["key"],
-                    extra={"delete_sources": bool(self.settings["delete_chd_sources"])}))
-            return job
+                    extra={"delete_sources": bool(self.settings["delete_chd_sources"])}
+                )) or submitted
+            return submitted
         if kind == "m3u":
             if not self.can_m3u(entry):
                 self.log(f"! m3u is not applicable to {entry['title']}")
                 return None
             folder_name = entry["system_folder"] or item_dir.name
             return self.pipeline.submit(Job(
-                kind="m3u", label=item_dir.name, target=item_dir,
+                kind="m3u", label=entry["title"], target=item_dir,
                 item_key=entry["key"],
                 extra={"system_folder": folder_name,
-                       "allowed_systems": self.settings["m3u_systems"]}))
+                       "allowed_systems": self.settings["m3u_systems"],
+                       # Only this game's discs - the folder holds others.
+                       "files": [str(p) for p in self.entry_files(entry)]}))
         return None
+
+    def _mark_stage(self, entry: dict, stage: str) -> None:
+        entry.setdefault("stages", {})[stage] = True
+        self.save_history()
+        self.emit({"type": "history_item", "item": self.decorate(entry)})
+
+    def next_stage(self, entry: dict, forced: bool) -> str | None:
+        """The stage this entry needs next, if any.
+
+        `forced` is Convert All, which runs a game all the way through;
+        otherwise the auto_* settings decide whether to continue.
+        """
+        stages = entry.get("stages", {})
+        if not stages.get("extracted"):
+            return "extract" if (forced or self.settings["auto_extract"]) else None
+        if self.can_chd(entry) and not stages.get("chd"):
+            return "chd" if (forced or self.settings["auto_compress"]) else None
+        if self.can_m3u(entry) and not stages.get("m3u"):
+            return "m3u" if (forced or self.settings["auto_m3u"]) else None
+        return None
+
+    def convert_all(self) -> int:
+        """Take every eligible game to its finished state, one click."""
+        submitted = 0
+        for entry in list(self.history):
+            stage = self.next_stage(entry, forced=True)
+            if stage is None:
+                continue
+            self._chaining.add(entry["key"])
+            if self.submit_stage(entry, stage):
+                submitted += 1
+            else:
+                self._chaining.discard(entry["key"])
+        return submitted
+
+    def reconcile_history(self) -> int:
+        """Bring stage flags in line with what is actually on disk.
+
+        Only ever upgrades a flag. Repairs history written before the stages
+        were tracked per game - notably entries that were compressed but left
+        unflagged, which would otherwise keep offering a COMPRESS button.
+        """
+        changed = 0
+        for entry in self.history:
+            stages = entry.setdefault("stages", {})
+            if entry.get("files_on_disk"):
+                self.track_files(entry, [])  # prune vanished files
+            if not stages.get("extracted"):
+                archives = [f for f in entry.get("files", [])
+                            if Path(f.get("archive", "")).is_file()]
+                if not archives and self.entry_files(entry):
+                    stages["extracted"] = True
+                    changed += 1
+            if (stages.get("extracted") and not stages.get("chd")
+                    and self._already_compressed(entry)):
+                stages["chd"] = True
+                changed += 1
+        if changed:
+            self.save_history()
+        return changed
 
     def _on_job_event(self, job: Job) -> None:
         self.emit({"type": "job", "job": job.as_dict()})
@@ -483,23 +610,43 @@ class Hub:
         entry = self.history_item(job.item_key) if job.item_key else None
         if entry is None:
             return
+        stage_completed = False
         if job.status == "done":
             if job.kind == "extract":
+                # Everything this archive produced belongs to this game.
+                self.track_files(entry, job.extra.get("extracted", []))
                 # Only mark the game extracted once no archive remains.
                 remaining = [f for f in entry.get("files", [])
                              if Path(f["archive"]).is_file()]
                 if not remaining:
                     entry["stages"]["extracted"] = True
-                    if self.settings["auto_compress"] and self.can_chd(entry):
-                        self.submit_stage(entry, "chd")
-                    elif self.settings["auto_m3u"] and self.can_m3u(entry):
-                        self.submit_stage(entry, "m3u")
+                    stage_completed = True
             elif job.kind == "chd":
-                entry["stages"]["chd"] = True
-                if self.settings["auto_m3u"] and self.can_m3u(entry):
-                    self.submit_stage(entry, "m3u")
+                # The .chd replaces the sheet and its tracks; re-tracking
+                # prunes what chdman deleted.
+                produced = job.extra.get("chd")
+                self.track_files(entry, [produced] if produced else [])
+                # A multi-disc game is not converted until every disc is, so
+                # this waits for the last sheet rather than the first.
+                if not chd_mod.compressible_among(self.entry_files(entry)):
+                    entry["stages"]["chd"] = True
+                    stage_completed = True
             elif job.kind == "m3u":
+                self.track_files(entry, job.extra.get("playlists", []))
                 entry["stages"]["m3u"] = True
+                stage_completed = True
+
+        chained = entry["key"] in self._chaining
+        if stage_completed:
+            following = self.next_stage(entry, forced=chained)
+            if following:
+                self.submit_stage(entry, following)
+            elif chained:
+                self._chaining.discard(entry["key"])
+        elif job.status == "failed" and chained:
+            # Don't keep driving a game whose stage just failed.
+            self._chaining.discard(entry["key"])
+
         self.save_history()
         self.emit({"type": "history_item", "item": self.decorate(entry)})
 
@@ -734,18 +881,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/convert-all")
     def convert_all():
-        submitted = 0
-        for entry in list(hub.history):
-            if not entry["stages"].get("extracted"):
-                if hub.submit_stage(entry, "extract"):
-                    submitted += 1
-            elif hub.can_chd(entry) and not entry["stages"].get("chd"):
-                if hub.submit_stage(entry, "chd"):
-                    submitted += 1
-            elif hub.can_m3u(entry) and not entry["stages"].get("m3u"):
-                if hub.submit_stage(entry, "m3u"):
-                    submitted += 1
-        return {"submitted": submitted}
+        return {"submitted": hub.convert_all()}
 
     @app.delete("/api/history/{key}")
     def remove_history(key: str):

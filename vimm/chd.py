@@ -216,10 +216,26 @@ def compress_to_chd(sheet: Path, delete_sources: bool = True,
     return out
 
 
-def compressible_sheets(folder: Path) -> list[Path]:
-    """The .cue/.gdi files under `folder` that don't already have a .chd."""
+def compressible_among(paths) -> list[Path]:
+    """The .cue/.gdi files in `paths` that don't already have a .chd.
+
+    Takes an explicit file list rather than a directory: a system folder holds
+    every game for that system, so scanning it would sweep up other games'
+    discs.
+    """
     sheets = []
-    for path in sorted(folder.rglob("*")):
-        if path.suffix.lower() in (".cue", ".gdi") and not path.with_suffix(".chd").exists():
+    for raw in paths:
+        path = Path(raw)
+        if (path.suffix.lower() in (".cue", ".gdi") and path.is_file()
+                and not path.with_suffix(".chd").exists()):
             sheets.append(path)
-    return sheets
+    return sorted(set(sheets))
+
+
+def compressible_sheets(folder: Path) -> list[Path]:
+    """Every compressible sheet under `folder`.
+
+    Only for whole-folder operations - per-game work must use
+    `compressible_among` with that game's own files.
+    """
+    return compressible_among(folder.rglob("*"))

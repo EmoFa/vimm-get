@@ -270,13 +270,14 @@ function renderHistory() {
       b.onclick = () => api("POST", `/api/items/${entry.key}/extract`).catch(alertErr);
       buttons.append(b);
     } else {
-      // Gated: only systems whose games actually benefit get these.
-      if (entry.can_chd && !stages.chd) {
+      // The server's flags already account for the stage being done, so
+      // there is one place that decides whether an action is offered.
+      if (entry.can_chd) {
         const b = el("button", "hbtn", "COMPRESS");
         b.onclick = () => api("POST", `/api/items/${entry.key}/chd`).catch(alertErr);
         buttons.append(b);
       }
-      if (entry.can_m3u && !stages.m3u) {
+      if (entry.can_m3u) {
         const b = el("button", "hbtn", "M3U");
         b.onclick = () => api("POST", `/api/items/${entry.key}/m3u`).catch(alertErr);
         buttons.append(b);
