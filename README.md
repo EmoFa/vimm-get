@@ -109,6 +109,33 @@ session with any "Get cookies.txt" extension while signed in to vimm.net and poi
 Settings at the file. Treat that file like a password (it is gitignored for exactly
 that reason).
 
+## Tests
+
+```bash
+python tests/run_all.py
+```
+
+Around 40 seconds, and **no network access** — the suites spin up a local HTTP server
+told to misbehave in the specific ways Vimm's Lair does (cutting a transfer mid-stream,
+answering 429 with the busy page, going silent mid-download) rather than touching the
+real site. Individual suites are standalone scripts:
+
+```bash
+python tests/test_download_resilience.py
+python tests/run_all.py test_search test_sweeps    # or a subset
+```
+
+Two things are opt-in, so a first run is neither slow nor surprising:
+
+- Suites needing **chdman** skip themselves with a notice if it isn't installed, rather
+  than pulling a ~90 MB download mid-test.
+- The live search checks, which do contact vimm.net, need `VIMMGET_LIVE_TESTS=1`.
+
+What they cover is mostly the things that were painful to get right: resuming a download
+across a pause (the filename the server picks isn't the one we plan for), releasing the
+per-IP slot, extraction progress on a single multi-gigabyte `.7z`, honeypot links in
+search results, per-game scoping of the CHD and m3u stages, and the reachability check.
+
 ## Layout
 
 ```
