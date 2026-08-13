@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VimmGet</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>⬇️</text></svg>">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand"><span class="brand-a">VIMM</span><span class="brand-sep">//</span><span class="brand-b">GET</span></div>
+    <div class="top-actions">
+      <button id="settings-btn" class="ghost" title="Settings">⚙</button>
+    </div>
+  </header>
+
+  <section class="inputrow">
+    <input id="omni" type="text" spellcheck="false"
+           placeholder="Paste vault URLs / IDs, one per line — or type to search...">
+    <button id="add-btn" class="accent">Add</button>
+  </section>
+
+  <section id="search-panel" class="panel hidden">
+    <div class="panel-head">
+      <span class="section-label">SEARCH RESULTS</span>
+      <span id="search-count" class="badge"></span>
+      <span class="grow"></span>
+      <button id="search-close" class="ghost">✕</button>
+    </div>
+    <div id="search-results" class="results"></div>
+    <div id="hidden-bar" class="hiddenbar hidden">
+      <span id="hidden-count"></span>
+      <button id="hidden-toggle" class="hbtn">SHOW</button>
+    </div>
+    <div id="hidden-results" class="results hidden"></div>
+  </section>
+
+  <section class="runbar">
+    <button id="start-btn" class="start" disabled>Start</button>
+    <span class="grow"></span>
+    <button id="pause-btn" class="warn ghost-border" disabled>Pause</button>
+    <button id="stop-btn" class="danger ghost-border" disabled>Stop</button>
+    <button id="clear-btn" class="ghost-border">Clear</button>
+  </section>
+
+  <div id="run-status" class="runstatus"></div>
+
+  <section>
+    <div class="section-head">
+      <span class="section-label">ACTIVE</span>
+      <span class="grow"></span>
+      <span id="active-count" class="badge">0</span>
+    </div>
+    <div id="active-list" class="cards"></div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="section-label">HISTORY</span>
+      <span id="history-count" class="badge">0</span>
+      <span class="grow"></span>
+      <button id="convert-all" class="pill">CONVERT ALL</button>
+    </div>
+    <div id="history-list" class="cards"></div>
+  </section>
+
+  <section id="log-section">
+    <div class="section-head clickable" id="log-toggle">
+      <span class="section-label">LOG</span>
+      <span class="grow"></span>
+      <span class="badge">▾</span>
+    </div>
+    <pre id="log" class="log hidden"></pre>
+  </section>
+
+  <!-- ================= settings drawer ================= -->
+  <div id="settings-panel" class="drawer hidden">
+    <div class="drawer-inner">
+      <div class="panel-head">
+        <span class="section-label">SETTINGS</span>
+        <span class="grow"></span>
+        <button id="settings-close" class="ghost">✕</button>
+      </div>
+
+      <label>Download folder
+        <input id="set-out" type="text" spellcheck="false">
+      </label>
+      <label class="checkline">
+        <input id="set-organize" type="checkbox">
+        <span>Sort into a folder per system (snes, psx, ...)</span>
+      </label>
+      <label>Preferred regions <span class="hint">affects version choice and search order</span>
+        <input id="set-prefer" type="text" placeholder="USA, Europe, Japan" spellcheck="false">
+      </label>
+      <div class="row3">
+        <label>Revision
+          <select id="set-policy">
+            <option value="latest">latest</option>
+            <option value="first">first</option>
+          </select>
+        </label>
+        <label>Delay (s)
+          <input id="set-delay" type="number" min="1" max="120" step="1">
+        </label>
+        <label>Retry sweeps
+          <input id="set-sweeps" type="number" min="0" max="50" step="1">
+        </label>
+      </div>
+      <label class="checkline">
+        <input id="set-cancelbusy" type="checkbox">
+        <span>Release an occupied download slot instead of waiting
+              <span class="hint">may cancel a stranger's download on a shared VPN</span></span>
+      </label>
+      <label>Cookies file <span class="hint">optional, for files that need an account</span>
+        <input id="set-cookies" type="text" spellcheck="false">
+      </label>
+
+      <div class="subhead">SEARCH FILTER</div>
+      <div id="tag-filters" class="taglist"></div>
+
+      <div class="subhead">AUTOMATION</div>
+      <label class="checkline"><input id="set-autoextract" type="checkbox">
+        <span>Extract archives after download (deletes archive + txt)</span></label>
+      <label class="checkline"><input id="set-autocompress" type="checkbox">
+        <span>Compress bin+cue / gdi to CHD after extraction</span></label>
+      <label class="checkline"><input id="set-autom3u" type="checkbox">
+        <span>Create m3u playlists for multi-disc games</span></label>
+      <label class="checkline"><input id="set-delchd" type="checkbox">
+        <span>Delete bin/cue sources after successful CHD compression</span></label>
+
+      <div class="subhead">SYSTEMS</div>
+      <label>CHD compression
+        <span class="hint">folder names whose games arrive as split disc images.
+          PS2/PSP are single ISOs and Jaguar emulators cannot read CHD, so they
+          are left out.</span>
+        <input id="set-chdsystems" type="text" spellcheck="false">
+      </label>
+      <label>m3u playlists <span class="hint">systems whose emulators read m3u</span>
+        <input id="set-m3usystems" type="text" spellcheck="false">
+      </label>
+
+      <button id="settings-save" class="accent wide">Save settings</button>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Core
+requests>=2.31
+
+# Web app (python run.py)
+fastapi>=0.111
+uvicorn[standard]>=0.30
+
+# Archive extraction (.7z)
+py7zr>=0.21
