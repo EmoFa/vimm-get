@@ -501,6 +501,75 @@ def human_duration(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------
+# Site reachability
+# --------------------------------------------------------------------------
+
+
+# Multi-word on purpose. The vault's own markup contains the single word
+# "unavailable" (the "Download unavailable" tag on entries with no file), so
+# loose matching would report maintenance on a perfectly healthy site.
+MAINTENANCE_PHRASES = (
+    "under maintenance",
+    "down for maintenance",
+    "scheduled maintenance",
+    "be right back",
+    "temporarily unavailable",
+)
+
+
+@dataclass
+class SiteStatus:
+    """Whether vimm.net itself is reachable.
+
+    `state` is one of "up", "maintenance", "down", or "unknown" before any
+    check has run. `detail` is a short human explanation for a tooltip.
+    """
+
+    state: str = "unknown"
+    detail: str = "not checked yet"
+    checked_at: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {"state": self.state, "detail": self.detail,
+                "checked_at": self.checked_at}
+
+
+def check_site(timeout: int = 10, base: str | None = None) -> SiteStatus:
+    """Fetch the site's front page and classify what came back.
+
+    A GET rather than a HEAD: maintenance is often served with a 200 status,
+    and only the body reveals it.
+    """
+    origin = (base or BASE).rstrip("/")
+    started = time.monotonic()
+    try:
+        response = requests.get(
+            origin + "/", headers={**BROWSER_HEADERS, "Referer": REFERER},
+            timeout=timeout,
+        )
+    except requests.Timeout:
+        return SiteStatus("down", f"no response within {timeout}s", time.time())
+    except requests.ConnectionError:
+        return SiteStatus("down", "could not connect", time.time())
+    except requests.RequestException as exc:
+        return SiteStatus("down", str(exc)[:120], time.time())
+
+    elapsed_ms = (time.monotonic() - started) * 1000
+    if response.status_code == 503:
+        return SiteStatus("maintenance", "HTTP 503 - the site is down for "
+                                         "maintenance", time.time())
+    if not response.ok:
+        return SiteStatus("down", f"HTTP {response.status_code}", time.time())
+
+    lowered = response.text.lower()
+    for phrase in MAINTENANCE_PHRASES:
+        if phrase in lowered:
+            return SiteStatus("maintenance", f"the site says: {phrase}", time.time())
+
+    return SiteStatus("up", f"responded in {elapsed_ms:.0f} ms", time.time())
+
+
+# --------------------------------------------------------------------------
 # Cookies
 # --------------------------------------------------------------------------
 

@@ -49,6 +49,27 @@ body {
 .brand-b { color: var(--text); }
 .top-actions { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 
+/* Whether vimm.net itself is reachable - checked at launch, click to
+   re-check. Quiet by default so it only draws the eye when something is
+   wrong. */
+.sitestatus {
+  display: flex; align-items: center; gap: 7px;
+  background: transparent; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--text-dim); font-family: var(--mono); font-size: 11px;
+  padding: 5px 12px;
+}
+.sitestatus:hover { color: var(--text); border-color: var(--text-faint); }
+.sitedot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-faint); transition: background .3s;
+}
+.sitestatus.up .sitedot          { background: var(--sage); }
+.sitestatus.maintenance .sitedot { background: var(--amber); }
+.sitestatus.down .sitedot        { background: var(--rose); }
+.sitestatus.checking .sitedot    { background: var(--text-faint); }
+.sitestatus.maintenance { color: var(--amber); border-color: #4a3a1e; }
+.sitestatus.down        { color: var(--rose);  border-color: #4a2530; }
+
 /* -------------------------------------------------------------- inputrow */
 .inputrow { display: flex; gap: 10px; margin-bottom: 10px; }
 .inputrow input {
