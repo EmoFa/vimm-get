@@ -28,7 +28,9 @@ from .engine import (
     Cancelled,
     Listener,
     Result,
+    SiteStatus,
     VimmError,
+    check_site,
     destination_for,
     human_bytes,
     human_duration,
@@ -140,6 +142,9 @@ class Hub:
         self.run_status = "idle"
         self.log_lines: list[str] = []
         self.tag_vocabulary: list[str] = list(search_mod.KNOWN_TAGS)
+        # Whether vimm.net itself is reachable. Checked once at startup and
+        # again whenever the user clicks the indicator.
+        self.site = SiteStatus()
 
         self.loop: asyncio.AbstractEventLoop | None = None
         self._sockets: set[WebSocket] = set()
@@ -181,6 +186,26 @@ class Hub:
             await socket.send_text(payload)
         except Exception:
             self._sockets.discard(socket)
+
+    # -------------------------------------------------------- site status
+
+    def check_site(self) -> None:
+        """Re-check whether vimm.net is reachable, off the event loop.
+
+        Runs on a throwaway thread so a slow or hanging request never delays
+        startup or blocks the server while it waits.
+        """
+        self.site = SiteStatus("checking", "contacting vimm.net...", time.time())
+        self.emit({"type": "site", "site": self.site.as_dict()})
+
+        def run() -> None:
+            result = check_site(base=self.site_base_override)
+            self.site = result
+            self.emit({"type": "site", "site": result.as_dict()})
+            if result.state != "up":
+                self.log(f"! vimm.net: {result.detail}")
+
+        threading.Thread(target=run, daemon=True, name="site-check").start()
 
     def log(self, text: str) -> None:
         with self._lock:
@@ -762,6 +787,23 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def _startup():
         hub.loop = asyncio.get_running_loop()
+        hub.check_site()
+
+    @app.middleware("http")
+    async def no_cache_frontend(request, call_next):
+        """Serve the interface fresh, always.
+
+        Without an explicit directive browsers fall back to heuristic caching
+        and can reuse index.html or style.css without revalidating, so an
+        update to web/ appears not to have happened. The app serves a few KB
+        from local disk, where caching buys nothing and costs exactly that
+        confusion.
+        """
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static"):
+            response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
 
     # ------------------------------------------------------------- state
 
@@ -775,7 +817,13 @@ def create_app() -> FastAPI:
             "run": hub.run_status,
             "log": hub.log_lines[-200:],
             "tag_vocabulary": hub.tag_vocabulary,
+            "site": hub.site.as_dict(),
         }
+
+    @app.post("/api/site/check")
+    def recheck_site():
+        hub.check_site()
+        return {"site": hub.site.as_dict()}
 
     # ------------------------------------------------------------- queue
 

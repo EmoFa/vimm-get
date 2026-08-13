@@ -78,6 +78,10 @@ function connectWS() {
       case "settings":
         state.settings = event.settings;
         break;
+      case "site":
+        state.site = event.site;
+        renderSite();
+        break;
     }
   };
   setInterval(() => { if (ws.readyState === 1) ws.send("ping"); }, 25000);
@@ -330,6 +334,30 @@ function renderRun() {
   $("run-status").textContent = state.run === "idle" ? "" : state.run;
 }
 
+/* ------------------------------------------------------------ site status */
+
+const SITE_LABELS = {
+  up: "Vimm online",
+  maintenance: "Maintenance",
+  down: "Vimm unreachable",
+  checking: "Checking...",
+  unknown: "Vimm status",
+};
+
+function renderSite() {
+  const site = state.site || { state: "unknown", detail: "", checked_at: 0 };
+  const button = $("site-status");
+  button.className = `sitestatus ${site.state}`;
+  $("site-label").textContent = SITE_LABELS[site.state] || SITE_LABELS.unknown;
+
+  let tip = site.detail || "";
+  if (site.checked_at && site.state !== "checking") {
+    const ago = Math.max(Math.round(Date.now() / 1000 - site.checked_at), 0);
+    tip += ago < 60 ? `  (checked just now)` : `  (checked ${duration(ago)} ago)`;
+  }
+  button.title = `${tip}\nClick to check again`;
+}
+
 function renderLog() {
   const log = $("log");
   log.textContent = state.log.join("\n");
@@ -490,6 +518,11 @@ $("convert-all").onclick = () => api("POST", "/api/convert-all")
   .then(r => { state.log.push(`convert all: ${r.submitted} job(s) submitted`); renderLog(); })
   .catch(alertErr);
 
+$("site-status").onclick = () => {
+  state.site = { state: "checking", detail: "contacting vimm.net...", checked_at: 0 };
+  renderSite();
+  api("POST", "/api/site/check").catch(alertErr);
+};
 $("settings-btn").onclick = () => { loadSettingsForm(); $("settings-panel").classList.remove("hidden"); };
 $("settings-close").onclick = () => $("settings-panel").classList.add("hidden");
 $("settings-save").onclick = () => saveSettings().catch(alertErr);
@@ -503,6 +536,7 @@ $("log-toggle").onclick = () => $("log").classList.toggle("hidden");
   state.jobs = Object.fromEntries((snapshot.jobs || []).map(j => [j.id, j]));
   renderActive();
   renderHistory();
+  renderSite();
   renderLog();
   connectWS();
 })();
