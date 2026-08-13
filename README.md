@@ -31,8 +31,7 @@ exactly which tags to hide. Tags are read from the site's own markup, so a game 
 _Demon's Crest_ is never mistaken for a demo.
 
 **Multi-disc games** — a game with more than one disc shows a checkbox per disc, all
-ticked by default. Untick any you don't want before starting. Between discs the card
-says `NEXT DISC IN 6s` so the polite pause doesn't look like a stall.
+ticked by default. Untick any you don't want before starting.
 
 **Start / Pause / Stop** — one download at a time, in queue order, with live speed and
 ETA. Pause and Stop are always safe: partial files are kept and **resume from the exact
@@ -50,8 +49,7 @@ done and the system actually needs it:
   by side.
 - **COMPRESS** — only for systems whose games arrive as split disc images
   (`psx, saturn, segacd, tgcd, dreamcast, cdimono1`), turning `bin+cue` / `gdi` into a
-  single `.chd`. PS2 and PSP are single ISOs with nothing to collapse, and Jaguar
-  emulators can't read CHD, so those show no button at all.
+  single `.chd`. You can add systems to the whitelist in the settings.
 - **M3U** — appears only after compression, and only for multi-disc games on
   m3u-capable systems. It creates a folder whose name ends in `.m3u`, moves the discs'
   `.chd` files into it, and writes a playlist listing each one on its own line:
