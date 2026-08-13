@@ -51,11 +51,30 @@ class PipelineWorker:
                                         name="pipeline")
         self._thread.start()
 
-    def submit(self, job: Job) -> Job:
+    def submit(self, job: Job) -> Job | None:
+        """Queue a job, unless the same work is already pending.
+
+        Returns None when the job was a duplicate. A second click on Convert
+        All, or two entries that happen to name the same file, must not queue
+        the same conversion twice - the second run would only fail on output
+        that already exists.
+        """
+        if self._pending_key(job) in {self._pending_key(existing)
+                                      for existing in self.jobs.values()
+                                      if existing.status in ("queued", "running")}:
+            return None
         self.jobs[job.id] = job
         self._queue.put(job)
         self.on_event(job)
         return job
+
+    @staticmethod
+    def _pending_key(job: Job) -> tuple[str, str]:
+        try:
+            target = str(Path(job.target).resolve())
+        except OSError:
+            target = str(job.target)
+        return job.kind, target
 
     def snapshot(self) -> list[dict]:
         return [job.as_dict() for job in self.jobs.values()]
@@ -107,10 +126,20 @@ class PipelineWorker:
             job.extra["chd"] = str(out)
             job.message = f"{out.name} ({out.stat().st_size / 1e6:.0f} MB)"
         elif job.kind == "m3u":
-            written = m3u_mod.make_playlists(
-                job.target, job.extra.get("system_folder", ""),
-                job.extra.get("allowed_systems"),
-            )
+            # Scoped to this game's own discs; the system folder holds every
+            # other game too, and a folder-wide sweep would build playlists
+            # for them as well.
+            files = job.extra.get("files")
+            if files:
+                written = m3u_mod.make_playlist_for(
+                    job.target, files, job.extra.get("system_folder", ""),
+                    job.extra.get("allowed_systems"),
+                )
+            else:
+                written = m3u_mod.make_playlists(
+                    job.target, job.extra.get("system_folder", ""),
+                    job.extra.get("allowed_systems"),
+                )
             job.extra["playlists"] = [str(p) for p in written]
             job.message = (f"{len(written)} playlist(s) written" if written
                            else "no multi-disc sets found (or system not m3u-capable)")

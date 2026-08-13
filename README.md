@@ -48,7 +48,7 @@ done and the system actually needs it:
   the system folder and removes the wrapper, so a multi-disc game's discs end up side
   by side.
 - **COMPRESS** — only for systems whose games arrive as split disc images
-  (`psx, saturn, segacd, tgcd, dreamcast, cdimono1`), turning `bin+cue` / `gdi` into a
+  (`psx, saturn, segacd, tgcd, dreamcast, cdimono1`), turning `bin + cue/gdi` into a
   single `.chd`. You can add systems to the whitelist in the settings.
 - **M3U** — appears only after compression, and only for multi-disc games on
   m3u-capable systems. It creates a folder whose name ends in `.m3u`, moves the discs'

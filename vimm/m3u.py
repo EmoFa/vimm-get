@@ -121,6 +121,45 @@ def build_m3u(folder: Path, game_name: str, discs: list[Path]) -> Path:
     return m3u_path
 
 
+def _playlists_from_groups(folder: Path, groups: dict[str, dict[int, Path]]) -> list[Path]:
+    written = []
+    for game_name, discs in groups.items():
+        if len(discs) < 2:
+            continue
+        written.append(build_m3u(folder, game_name, [discs[d] for d in sorted(discs)]))
+    return written
+
+
+def _group_files(files) -> dict[str, dict[int, Path]]:
+    """Group disc files by game, keeping the best file per disc."""
+    groups: dict[str, dict[int, Path]] = {}
+    for raw in files:
+        path = Path(raw)
+        if not path.is_file() or path.suffix.lower() not in _PLAYLIST_TYPES:
+            continue
+        disc = disc_number(path.name)
+        if disc is None:
+            continue
+        discs = groups.setdefault(group_key(path.name), {})
+        current = discs.get(disc)
+        if current is None or _rank(path) < _rank(current):
+            discs[disc] = path
+    return groups
+
+
+def make_playlist_for(folder: Path, files, system_folder_name: str,
+                      allowed_systems: list[str] | None = None) -> list[Path]:
+    """Build playlists for one game's own disc files.
+
+    The folder-wide variant would also pick up other multi-disc games sitting
+    in the same system folder, so per-game work goes through here.
+    """
+    allowed = allowed_systems if allowed_systems is not None else DEFAULT_M3U_SYSTEMS
+    if system_folder_name.lower() not in [s.lower() for s in allowed]:
+        return []
+    return _playlists_from_groups(folder, _group_files(files))
+
+
 def make_playlists(folder: Path, system_folder_name: str,
                    allowed_systems: list[str] | None = None) -> list[Path]:
     """Create playlists for every multi-disc set in `folder`, if the system
