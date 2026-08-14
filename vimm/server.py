@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import queue
 import threading
 import time
 import uuid
@@ -32,9 +31,11 @@ from .engine import (
     VimmError,
     check_site,
     destination_for,
+    find_download,
     human_bytes,
     human_duration,
     make_options,
+    safe_filename,
     parse_id_lines,
     run_http,
     system_folder,
@@ -152,6 +153,9 @@ class Hub:
 
         self._run_thread: threading.Thread | None = None
         self._cancel = threading.Event()
+        # Set by Stop (as opposed to Pause) so the cancelled run knows to
+        # throw the partial downloads away rather than keep them.
+        self._discard_on_stop = False
         self._pages: dict[int, object] = {}   # vault_id -> VaultPage
         self._opts = None
 
@@ -162,13 +166,6 @@ class Hub:
         self.pipeline = PipelineWorker(on_event=self._on_job_event)
         self.search_session = search_mod.make_session()
         self.reconcile_history()
-
-        # Background resolver: fills in title/system/discs for queued items
-        # so the disc picker and the per-system buttons work before any
-        # download starts.
-        self._resolve_queue: queue.Queue[int] = queue.Queue()
-        threading.Thread(target=self._resolve_loop, daemon=True,
-                         name="resolver").start()
 
     # ------------------------------------------------------------ event bus
 
@@ -239,10 +236,10 @@ class Hub:
                 })
                 added.append(vault_id)
         if added:
+            # Deliberately no page lookups here. Names fill in as the run
+            # reaches each game, or on demand when an item is opened.
             self.log(f"added {len(added)} item(s) to the queue")
             self.emit({"type": "queue", "queue": self.queue})
-            for vault_id in added:
-                self._resolve_queue.put(vault_id)
         return len(added)
 
     def queue_item(self, vault_id: int) -> dict | None:
@@ -257,49 +254,74 @@ class Hub:
 
     # ---------------------------------------------------------- resolution
 
-    def _resolve_loop(self) -> None:
-        """Fetch each queued game's vault page once, for title/size/discs."""
-        from .engine import VimmClient
+    def apply_page(self, vault_id: int, page) -> None:
+        """Fill in an item's real title, system and disc list from its page."""
+        self._pages[vault_id] = page
+        opts = self._opts or self.build_options()
+        discs: dict[int, dict] = {}
+        for media in page.media:
+            # One row per disc; which version is downloaded is decided later
+            # by the engine's preference rules.
+            discs.setdefault(media.disc, {
+                "disc": media.disc,
+                "size_text": media.size_text(0),
+                "selected": True,
+            })
+        self.patch_item(
+            vault_id,
+            title=page.title,
+            system=system_folder(page.title, getattr(opts, "folders", None)),
+            size_text=page.media[0].size_text(0) if page.media else "",
+            discs=[discs[d] for d in sorted(discs)],
+            resolved=True,
+        )
 
-        while True:
-            vault_id = self._resolve_queue.get()
-            item = self.queue_item(vault_id)
-            if item is None or item.get("resolved"):
-                continue
-            try:
-                opts = self.build_options()
-                client = VimmClient(opts)
-                page = client.fetch_vault(vault_id)
-                self._pages[vault_id] = page
+    def resolve_item(self, vault_id: int) -> dict:
+        """Look one game up now, on request.
 
-                discs: dict[int, dict] = {}
-                for media in page.media:
-                    # One row per disc; the version actually downloaded is
-                    # chosen later by the engine's preference rules.
-                    discs.setdefault(media.disc, {
-                        "disc": media.disc,
-                        "size_text": media.size_text(0),
-                        "selected": True,
-                    })
-                folder = system_folder(page.title,
-                                       getattr(opts, "folders", None))
-                self.patch_item(
-                    vault_id,
-                    title=page.title,
-                    system=folder,
-                    size_text=page.media[0].size_text(0) if page.media else "",
-                    discs=[discs[d] for d in sorted(discs)],
-                    resolved=True,
-                )
-            except VimmError as exc:
-                self.patch_item(vault_id, status="failed", message=str(exc),
+        Nothing is fetched when a game is queued: the run fetches each page
+        anyway, and looking every pasted ID up front is what tripped the
+        site's rate limit. This runs only when someone opens an item to
+        choose discs.
+        """
+        item = self.queue_item(vault_id)
+        if item is None:
+            return {"error": "unknown item"}
+        if item.get("resolved") or vault_id in self._pages:
+            if vault_id in self._pages and not item.get("resolved"):
+                self.apply_page(vault_id, self._pages[vault_id])
+            return {"item": self.queue_item(vault_id)}
+
+        from .engine import BusyError, VimmClient
+
+        try:
+            # A name lookup is optional and someone is waiting on it, so it
+            # gives up at the first refusal. The engine's patient retry
+            # schedule - up to 20 busy waits growing to five minutes each -
+            # belongs to downloads, not to this.
+            opts = self.build_options()
+            opts.retries = 0
+            opts.busy_retries = 0
+            opts.max_attempts = 1
+            opts.timeout = min(opts.timeout, 20)
+            client = VimmClient(opts)
+            self.apply_page(vault_id, client.fetch_vault(vault_id))
+        except BusyError as exc:
+            # Throttling is not a property of this game. Leave it queued and
+            # unresolved so it can be looked up again, or simply downloaded.
+            self.patch_item(vault_id, message="the site is busy - try again")
+            self.log(f"! vault/{vault_id}: {exc}")
+        except VimmError as exc:
+            message = str(exc)
+            if "429" in message or "busy" in message.lower():
+                self.patch_item(vault_id, message="the site is busy - try again")
+            else:
+                self.patch_item(vault_id, status="failed", message=message,
                                 resolved=True)
-                self.log(f"! vault/{vault_id}: {exc}")
-            except Exception as exc:  # noqa: BLE001 - never kill the resolver
-                self.patch_item(vault_id, status="failed", message=str(exc),
-                                resolved=True)
-            # Courtesy gap between page fetches.
-            time.sleep(1.0)
+            self.log(f"! vault/{vault_id}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - a lookup must never crash the app
+            self.log(f"! vault/{vault_id}: {exc}")
+        return {"item": self.queue_item(vault_id)}
 
     # ---------------------------------------------------------------- runs
 
@@ -352,19 +374,91 @@ class Hub:
         self.emit({"type": "run", "status": self.run_status})
         return "started"
 
+    def item_partials(self, vault_ids: list[int] | None = None) -> list[Path]:
+        """Partial downloads belonging to the given queue items.
+
+        Only `.part` files, found under whatever name the server gave them
+        (the large disc systems arrive as .7z, not the .zip we plan for), so
+        a finished download can never be caught up in this.
+        """
+        found: list[Path] = []
+        opts = self._opts or self.build_options()
+        wanted = set(vault_ids) if vault_ids is not None else None
+        for item in self.queue:
+            if wanted is not None and item["vault_id"] not in wanted:
+                continue
+            page = self._pages.get(item["vault_id"])
+            if page is None:
+                continue
+            dest = Path(destination_for(page, opts))
+            for media in page.media:
+                stem = safe_filename(Path(media.filename).stem,
+                                     f"media-{media.media_id}")
+                part = find_download(dest, stem, partial=True)
+                if part is not None and part not in found:
+                    found.append(part)
+        return found
+
+    def partials_summary(self) -> dict:
+        parts = self.item_partials()
+        total = 0
+        for path in parts:
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+        return {"count": len(parts), "bytes": total,
+                "human": human_bytes(total) if total else ""}
+
     def stop_run(self, pause: bool) -> str:
-        if self._run_thread is None or not self._run_thread.is_alive():
+        """Pause keeps the partial files; Stop throws them away.
+
+        Until now these differed only in the status text, which made the two
+        buttons indistinguishable in use.
+        """
+        running = self._run_thread is not None and self._run_thread.is_alive()
+        self._discard_on_stop = not pause
+        if not running:
+            # Stop still has meaning when idle: clear out partial downloads
+            # left behind by an earlier run.
+            if not pause:
+                self._discard_partials()
             return "not running"
         self._cancel.set()
         self.run_status = "pausing" if pause else "stopping"
         self.emit({"type": "run", "status": self.run_status})
         return self.run_status
 
+    def _discard_partials(self) -> int:
+        """Delete partial downloads and reset their items to queued."""
+        removed = 0
+        freed = 0
+        for path in self.item_partials():
+            try:
+                freed += path.stat().st_size
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                self.log(f"! could not remove {path.name}: {exc}")
+        with self._lock:
+            for item in self.queue:
+                if item["status"] in ("paused", "downloading", "working",
+                                      "waiting", "failed"):
+                    item.update(status="queued", progress=0.0, message="",
+                                speed=0.0, eta=0.0, waiting_until=0)
+        if removed:
+            self.log(f"discarded {removed} partial download(s), "
+                     f"freeing {human_bytes(freed)}")
+        self.emit({"type": "queue", "queue": self.queue})
+        return removed
+
     def _run(self, ids: list[int]) -> None:
         listener = WebListener(self)
         try:
+            # Share the page cache: anything already looked up for the disc
+            # picker is reused, and pages fetched here serve later sweeps.
             results = run_http(ids, self._opts, listener=listener,
-                               cancel_event=self._cancel)
+                               cancel_event=self._cancel, pages=self._pages)
             done = sum(1 for r in results if r.status == "ok")
             failed = sum(1 for r in results if r.status == "failed")
             self.run_status = (f"finished - {done} downloaded"
@@ -375,13 +469,18 @@ class Hub:
                 except OSError:
                     pass
         except Cancelled:
-            self.run_status = "paused - partial files resume on Start"
-            with self._lock:
-                for item in self.queue:
-                    if item["status"] in ("working", "downloading", "waiting",
-                                          "queued"):
-                        item["status"] = "paused"
-            self.emit({"type": "queue", "queue": self.queue})
+            if getattr(self, "_discard_on_stop", False):
+                # Stop: nothing is kept, so the next run starts clean.
+                self._discard_partials()
+                self.run_status = "stopped - partial downloads discarded"
+            else:
+                with self._lock:
+                    for item in self.queue:
+                        if item["status"] in ("working", "downloading",
+                                              "waiting", "queued"):
+                            item["status"] = "paused"
+                self.run_status = "paused - partial files resume on Start"
+                self.emit({"type": "queue", "queue": self.queue})
         except VimmError as exc:
             self.run_status = f"error: {exc}"
             self.log(f"! {exc}")
@@ -694,8 +793,9 @@ class WebListener(Listener):
         self.hub.log(f"{sweep_label}[{position}/{total}] vault/{vault_id}")
 
     def page_resolved(self, page):
-        self.hub._pages[page.vault_id] = page
-        self.hub.patch_item(page.vault_id, title=page.title)
+        # The run has the page in hand, so fill the row in properly - this is
+        # how names appear without any lookup of their own.
+        self.hub.apply_page(page.vault_id, page)
         self.hub.log(f"  {page.title}")
 
     def status(self, text):
@@ -842,6 +942,14 @@ def create_app() -> FastAPI:
         added = hub.add_ids(pairs)
         return {"added": added, "queue": hub.queue}
 
+    @app.post("/api/queue/{vault_id}/resolve")
+    def resolve_one(vault_id: int):
+        """Look a single game up, when its row is opened."""
+        result = hub.resolve_item(vault_id)
+        if "error" in result:
+            return JSONResponse(result, status_code=404)
+        return result
+
     @app.post("/api/queue/{vault_id}/discs")
     def set_discs(vault_id: int, body: dict):
         """Tick/untick which discs of a multi-disc game to download."""
@@ -891,6 +999,11 @@ def create_app() -> FastAPI:
     @app.post("/api/run/stop")
     def stop():
         return {"status": hub.stop_run(pause=False), "run": hub.run_status}
+
+    @app.get("/api/run/partials")
+    def partials():
+        """What Stop would throw away, so the prompt can be truthful."""
+        return hub.partials_summary()
 
     # ------------------------------------------------------------- search
 

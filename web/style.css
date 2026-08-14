@@ -71,8 +71,8 @@ body {
 .sitestatus.down        { color: var(--rose);  border-color: #4a2530; }
 
 /* -------------------------------------------------------------- inputrow */
-.inputrow { display: flex; gap: 10px; margin-bottom: 10px; }
-.inputrow input {
+.inputrow { display: flex; gap: 10px; margin-bottom: 10px; align-items: flex-start; }
+.inputrow textarea {
   flex: 1;
   background: var(--bg-inset);
   border: 1px solid var(--line);
@@ -82,9 +82,13 @@ body {
   font-size: 13px;
   padding: 12px 14px;
   outline: none;
+  resize: none;
+  overflow-y: auto;
+  line-height: 1.4;
+  max-height: 190px;   /* grows with a pasted list, then scrolls */
 }
-.inputrow input:focus { border-color: var(--amber-deep); }
-.inputrow input::placeholder { color: var(--text-faint); }
+.inputrow textarea:focus { border-color: var(--amber-deep); }
+.inputrow textarea::placeholder { color: var(--text-faint); }
 
 /* --------------------------------------------------------------- buttons */
 button {
@@ -186,6 +190,32 @@ button:disabled { opacity: .35; cursor: default; filter: none; }
 }
 .icon-btn:hover { color: var(--text); background: var(--bg-raised); }
 .icon-btn.x:hover { color: var(--rose); }
+
+/* ------------------------------------------------------- queued rows */
+/* Anything merely waiting is one line, so a fifty-item queue stays
+   readable. Clicking a row opens it for the disc picker. */
+.rows { display: flex; flex-direction: column; gap: 3px; }
+.queue-row {
+  background: var(--bg-card); border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.queue-row.open { border-color: var(--amber-deep); }
+.queue-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 12px; cursor: pointer;
+}
+.queue-head:hover { background: var(--bg-raised); border-radius: 8px; }
+.queue-caret { color: var(--text-faint); font-size: 10px; width: 10px; }
+.queue-title {
+  font-size: 13.5px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; max-width: 46ch;
+}
+.queue-size { font-family: var(--mono); font-size: 11px; color: var(--amber); }
+.queue-note { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+.queue-body {
+  padding: 0 12px 10px 32px; display: flex; flex-direction: column; gap: 6px;
+}
+.queue-body .discs { margin-top: 0; padding-top: 0; border-top: none; }
 
 /* ------------------------------------------------------------ disc picker */
 .discs {

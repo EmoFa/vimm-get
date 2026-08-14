@@ -20,8 +20,10 @@
   </header>
 
   <section class="inputrow">
-    <input id="omni" type="text" spellcheck="false"
-           placeholder="Paste vault URLs / IDs, one per line — or type to search...">
+    <!-- A textarea, not an input: an input silently strips newlines from a
+         pasted list, which turned "one per line" into a single number. -->
+    <textarea id="omni" rows="1" spellcheck="false"
+              placeholder="Paste vault URLs / IDs, one per line — or type to search..."></textarea>
     <button id="add-btn" class="accent">Add</button>
   </section>
 
@@ -43,8 +45,10 @@
   <section class="runbar">
     <button id="start-btn" class="start" disabled>Start</button>
     <span class="grow"></span>
-    <button id="pause-btn" class="warn ghost-border" disabled>Pause</button>
-    <button id="stop-btn" class="danger ghost-border" disabled>Stop</button>
+    <button id="pause-btn" class="warn ghost-border" disabled
+            title="Stop after the current chunk. Partial files are kept, and Start resumes exactly where it left off.">Pause</button>
+    <button id="stop-btn" class="danger ghost-border"
+            title="Stop and discard partial downloads so the next run starts clean. Asks first.">Stop</button>
     <button id="clear-btn" class="ghost-border">Clear</button>
   </section>
 
@@ -57,6 +61,15 @@
       <span id="active-count" class="badge">0</span>
     </div>
     <div id="active-list" class="cards"></div>
+  </section>
+
+  <section id="queued-section" class="hidden">
+    <div class="section-head">
+      <span class="section-label">QUEUED</span>
+      <span class="grow"></span>
+      <span id="queued-count" class="badge">0</span>
+    </div>
+    <div id="queued-list" class="rows"></div>
   </section>
 
   <section>

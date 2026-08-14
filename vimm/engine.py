@@ -316,7 +316,16 @@ def parse_id_lines(lines, source: str = "input", warn=None) -> list[int]:
             if warn:
                 warn(f"{source}:{lineno}: cannot read an ID from {raw.strip()!r}")
             continue
-        vault_id = int(match.group(1))
+        digits = match.group(1)
+        # Real vault IDs are six digits or so. Anything wildly longer is not
+        # an ID - most likely a list that lost its line breaks somewhere and
+        # ran together into one number.
+        if len(digits) > 8:
+            if warn:
+                warn(f"{source}:{lineno}: {digits[:12]}... is too long to be a "
+                     f"vault ID - is this several IDs run together?")
+            continue
+        vault_id = int(digits)
         if vault_id in seen:
             continue
         seen.add(vault_id)
@@ -1244,9 +1253,16 @@ def run_pass(
     opts: argparse.Namespace,
     client: VimmClient,
     label: str = "",
+    pages: dict[int, VaultPage] | None = None,
 ) -> list[Result]:
     """One pass over the ID list. Safe to repeat: finished files are skipped
-    and partial ones resume, so a second pass only does outstanding work."""
+    and partial ones resume, so a second pass only does outstanding work.
+
+    `pages` is a shared cache of already-fetched vault pages. A front-end that
+    has looked a game up (to show its discs, say) passes it in so the page is
+    not requested a second time; pages fetched here are added to it. One page
+    view per game keeps well clear of the site's rate limit.
+    """
     listener = client.listener
     results: list[Result] = []
     downloads_done = 0
@@ -1255,7 +1271,11 @@ def run_pass(
         client._check_cancelled()
         listener.item_started(index, len(vault_ids), vault_id, label)
         try:
-            page = client.fetch_vault(vault_id)
+            page = pages.get(vault_id) if pages is not None else None
+            if page is None:
+                page = client.fetch_vault(vault_id)
+                if pages is not None:
+                    pages[vault_id] = page
         except VimmError as exc:
             listener.status(f"FAIL  {exc}")
             result = Result(vault_id, "?", "", "failed", 0, str(exc))
@@ -1314,6 +1334,7 @@ def run_http(
     opts: argparse.Namespace,
     listener: Listener | None = None,
     cancel_event: threading.Event | None = None,
+    pages: dict[int, VaultPage] | None = None,
 ) -> list[Result]:
     listener = listener or Listener()
     client = VimmClient(opts, listener=listener, cancel_event=cancel_event)
@@ -1324,7 +1345,7 @@ def run_http(
             raise VimmError(f"Cookie file not found: {cookie_path}")
         listener.status(f"cookies: {load_cookies(client.session, cookie_path)}")
 
-    results = run_pass(vault_ids, opts, client)
+    results = run_pass(vault_ids, opts, client, pages=pages)
     if opts.list or opts.sweeps <= 0:
         return results
 
@@ -1346,7 +1367,8 @@ def run_http(
         before = sum(r.partial for rs in final.values() for r in rs)
         listener.sweep_started(sweep, len(pending))
 
-        swept = run_pass(pending, opts, client, label=f"sweep {sweep} ")
+        swept = run_pass(pending, opts, client, label=f"sweep {sweep} ",
+                         pages=pages)
         for r in swept:
             final[r.vault_id] = [x for x in final[r.vault_id] if x.status != "failed"]
             final[r.vault_id].append(r)

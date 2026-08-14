@@ -7,6 +7,7 @@ const $ = (id) => document.getElementById(id);
 
 const state = {
   queue: [],
+  expanded: new Set(),   // queued rows opened for their disc picker
   history: [],
   jobs: {},      // id -> job
   settings: {},
@@ -127,11 +128,114 @@ const CHIP = {
 
 /* --------------------------------------------------------------- active */
 
+// Items being worked on get a full card; everything merely waiting gets one
+// compact line, so a queue of fifty stays readable.
+const BUSY = ["downloading", "working", "waiting", "paused"];
+
+function discPicker(item) {
+  const discs = item.discs || [];
+  if (discs.length < 2) return null;
+  const row = el("div", "discs");
+  row.append(el("span", "disc-label", `${discs.length} DISCS`));
+  for (const disc of discs) {
+    const chip = el("label", "disc-chip" + (disc.selected ? " on" : ""));
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = disc.selected;
+    box.disabled = ["downloading", "working", "waiting"].includes(item.status);
+    box.onchange = () => {
+      disc.selected = box.checked;
+      const wanted = discs.filter(d => d.selected).map(d => d.disc);
+      api("POST", `/api/queue/${item.vault_id}/discs`, { discs: wanted })
+        .catch(alertErr);
+      chip.classList.toggle("on", box.checked);
+    };
+    chip.append(box, el("span", null, `Disc ${disc.disc}`));
+    if (disc.size_text) chip.append(el("span", "disc-label", disc.size_text));
+    row.append(chip);
+  }
+  return row;
+}
+
+function queueControls(item) {
+  const buttons = el("span", "card-buttons");
+  const up = el("button", "icon-btn", "▲");
+  const down = el("button", "icon-btn", "▼");
+  up.onclick = (e) => { e.stopPropagation(); move(item.vault_id, -1); };
+  down.onclick = (e) => { e.stopPropagation(); move(item.vault_id, +1); };
+  const remove = el("button", "icon-btn x", "✕");
+  remove.title = "Remove from queue";
+  remove.onclick = (e) => {
+    e.stopPropagation();
+    api("DELETE", `/api/queue/${item.vault_id}`)
+      .then(r => { state.queue = r.queue; renderActive(); });
+  };
+  buttons.append(up, down, remove);
+  return buttons;
+}
+
+function queuedRow(item) {
+  const open = state.expanded.has(item.vault_id);
+  const row = el("div", "queue-row" + (open ? " open" : ""));
+
+  const head = el("div", "queue-head");
+  head.append(el("span", "queue-caret", open ? "▾" : "▸"));
+  head.append(el("span", "queue-title", item.title));
+  if (item.system) head.append(el("span", "sysbadge", item.system));
+  if (item.size_text) head.append(el("span", "queue-size", item.size_text));
+  if ((item.discs || []).length > 1)
+    head.append(el("span", "disc-label", `${item.discs.length} discs`));
+  if (item.status === "failed")
+    head.append(el("span", "chip failed", "FAILED"));
+  head.append(el("span", "grow"));
+  if (item.message) head.append(el("span", "queue-note", item.message));
+  head.append(queueControls(item));
+
+  // Opening a row is also when its name gets looked up - nothing is fetched
+  // just for sitting in the queue.
+  head.onclick = () => {
+    if (state.expanded.has(item.vault_id)) state.expanded.delete(item.vault_id);
+    else {
+      state.expanded.add(item.vault_id);
+      if (!item.resolved) {
+        item.message = "looking up...";
+        api("POST", `/api/queue/${item.vault_id}/resolve`)
+          .then(r => {
+            const i = state.queue.findIndex(q => q.vault_id === item.vault_id);
+            if (i >= 0 && r.item) state.queue[i] = r.item;
+            renderActive();
+          })
+          .catch(alertErr);
+      }
+    }
+    renderActive();
+  };
+  row.append(head);
+
+  if (open) {
+    const body = el("div", "queue-body");
+    body.append(el("span", "meta", `vault/${item.vault_id}`));
+    const picker = discPicker(item);
+    if (picker) body.append(picker);
+    row.append(body);
+  }
+  return row;
+}
+
 function renderActive() {
   const list = $("active-list");
+  const queuedList = $("queued-list");
   list.replaceChildren();
+  queuedList.replaceChildren();
 
-  for (const item of state.queue) {
+  const busy = state.queue.filter(q => BUSY.includes(q.status));
+  const waiting = state.queue.filter(q => !BUSY.includes(q.status));
+
+  for (const item of waiting) queuedList.append(queuedRow(item));
+  $("queued-count").textContent = waiting.length;
+  $("queued-section").classList.toggle("hidden", waiting.length === 0);
+
+  for (const item of busy) {
     const card = el("div", "card" + (item.status === "downloading" ? " working" : ""));
     const top = el("div", "card-top");
 
@@ -148,17 +252,7 @@ function renderActive() {
     }
     top.append(el("span", `chip ${chipClass}`, chipText));
 
-    const buttons = el("span", "card-buttons");
-    const up = el("button", "icon-btn", "▲");
-    const down = el("button", "icon-btn", "▼");
-    up.onclick = () => move(item.vault_id, -1);
-    down.onclick = () => move(item.vault_id, +1);
-    const remove = el("button", "icon-btn x", "✕");
-    remove.title = "Remove from queue";
-    remove.onclick = () => api("DELETE", `/api/queue/${item.vault_id}`)
-      .then(r => { state.queue = r.queue; renderActive(); });
-    buttons.append(up, down, remove);
-    top.append(buttons);
+    top.append(queueControls(item));
     card.append(top);
 
     const sub = el("div", "card-sub");
@@ -170,30 +264,8 @@ function renderActive() {
     }
     card.append(sub);
 
-    // Disc picker: only meaningful for multi-disc games.
-    const discs = item.discs || [];
-    if (discs.length > 1) {
-      const row = el("div", "discs");
-      row.append(el("span", "disc-label", `${discs.length} DISCS`));
-      for (const disc of discs) {
-        const chip = el("label", "disc-chip" + (disc.selected ? " on" : ""));
-        const box = document.createElement("input");
-        box.type = "checkbox";
-        box.checked = disc.selected;
-        box.disabled = ["downloading", "working", "waiting"].includes(item.status);
-        box.onchange = () => {
-          disc.selected = box.checked;
-          const wanted = discs.filter(d => d.selected).map(d => d.disc);
-          api("POST", `/api/queue/${item.vault_id}/discs`, { discs: wanted })
-            .catch(alertErr);
-          chip.classList.toggle("on", box.checked);
-        };
-        chip.append(box, el("span", null, `Disc ${disc.disc}`));
-        if (disc.size_text) chip.append(el("span", "disc-label", disc.size_text));
-        row.append(chip);
-      }
-      card.append(row);
-    }
+    const picker = discPicker(item);
+    if (picker) card.append(picker);
 
     if (["downloading", "working", "paused", "waiting"].includes(item.status)) {
       const bar = el("div", "bar" + (item.status === "waiting" ? " waiting" : ""));
@@ -226,7 +298,7 @@ function renderActive() {
     list.append(card);
   }
 
-  const active = state.queue.length
+  const active = busy.length
     + Object.values(state.jobs).filter(j => j.status !== "done" && j.status !== "failed").length;
   $("active-count").textContent = active;
   renderRun();
@@ -330,7 +402,9 @@ function renderRun() {
   const pending = state.queue.some(q => !["done", "skipped"].includes(q.status));
   $("start-btn").disabled = running || !pending;
   $("pause-btn").disabled = !running;
-  $("stop-btn").disabled = !running;
+  // Stop also clears partial downloads left by an earlier session, so it
+  // stays available whenever there is a queue to act on.
+  $("stop-btn").disabled = !running && state.queue.length === 0;
   $("run-status").textContent = state.run === "idle" ? "" : state.run;
 }
 
@@ -383,6 +457,7 @@ async function onAdd() {
     state.queue = r.queue;
     renderActive();
     $("omni").value = "";
+    sizeOmni();
     $("search-panel").classList.add("hidden");
   } else {
     await runSearch(text);
@@ -502,6 +577,14 @@ $("add-btn").onclick = () => onAdd().catch(alertErr);
 $("omni").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onAdd().catch(alertErr); }
 });
+// Grow with a pasted list rather than hiding it behind a one-line box.
+function sizeOmni() {
+  const box = $("omni");
+  box.style.height = "auto";
+  box.style.height = Math.min(box.scrollHeight, 190) + "px";
+}
+$("omni").addEventListener("input", sizeOmni);
+$("omni").addEventListener("paste", () => setTimeout(sizeOmni, 0));
 $("search-close").onclick = () => $("search-panel").classList.add("hidden");
 $("hidden-toggle").onclick = () => {
   const box = $("hidden-results");
@@ -511,7 +594,22 @@ $("hidden-toggle").onclick = () => {
 
 $("start-btn").onclick = () => api("POST", "/api/run/start").catch(alertErr);
 $("pause-btn").onclick = () => api("POST", "/api/run/pause").catch(alertErr);
-$("stop-btn").onclick = () => api("POST", "/api/run/stop").catch(alertErr);
+// Stop throws partial downloads away - the one destructive action here - so
+// it always asks first, and says what it would cost.
+$("stop-btn").onclick = async () => {
+  try {
+    const p = await api("GET", "/api/run/partials");
+    const what = p.count
+      ? `Discard ${p.count} partial download${p.count === 1 ? "" : "s"} (${p.human})?`
+      : "Stop the run?";
+    const detail = p.count
+      ? "\n\nThose bytes are lost and the affected games start again from the "
+        + "beginning next time.\nUse Pause instead to keep them and resume exactly."
+      : "";
+    if (!confirm(what + detail)) return;
+    await api("POST", "/api/run/stop");
+  } catch (err) { alertErr(err); }
+};
 $("clear-btn").onclick = () => api("POST", "/api/queue/clear")
   .then(r => { state.queue = r.queue; renderActive(); });
 $("convert-all").onclick = () => api("POST", "/api/convert-all")
