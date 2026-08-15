@@ -890,7 +890,16 @@ class Hub:
                     entry["stages"]["chd"] = True
                     stage_completed = True
             elif job.kind == "m3u":
-                self.track_files(entry, job.extra.get("playlists", []))
+                # The discs move into the playlist folder, so the paths we
+                # were tracking no longer exist and would simply be pruned,
+                # leaving the entry with no record of its own game. That
+                # folder holds this game and nothing else, so re-track it.
+                playlists = job.extra.get("playlists", [])
+                moved = [str(sibling)
+                         for playlist in playlists
+                         for sibling in Path(playlist).parent.iterdir()
+                         if sibling.is_file()]
+                self.track_files(entry, playlists + moved)
                 entry["stages"]["m3u"] = True
                 stage_completed = True
 
@@ -1007,8 +1016,6 @@ class WebListener(Listener):
                 plan["failed"] += 1
 
         entry = self.hub.add_history(result)
-        if entry is not None and self.hub.settings["auto_extract"]:
-            self.hub.submit_stage(entry, "extract")
 
         if plan is not None and plan["left"] > 0 and result.status == "ok":
             # One disc of several. The game is not finished, so its row stays
@@ -1020,6 +1027,17 @@ class WebListener(Listener):
                 waiting_until=0,
                 message=f"disc done, {remaining} more to go")
             return
+
+        # Every chosen disc has arrived, so post-processing can begin - and
+        # not one moment sooner. Extraction declares a game extracted once no
+        # archive is left to unpack, which after disc 1 of 2 is perfectly
+        # true and completely wrong: CHD would then compress the only disc it
+        # could see, mark itself done, and the playlist would be built from
+        # half a game. Nothing here is per-disc; `submit_stage` picks up every
+        # archive the entry has.
+        if (entry is not None and self.hub.settings["auto_extract"]
+                and (plan is None or plan["failed"] == 0)):
+            self.hub.submit_stage(entry, "extract")
 
         status_map = {"ok": "done", "skipped": "skipped", "failed": "failed",
                       "listed": "listed"}
