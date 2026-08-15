@@ -20,8 +20,10 @@
   </header>
 
   <section class="inputrow">
-    <input id="omni" type="text" spellcheck="false"
-           placeholder="Paste vault URLs / IDs, one per line — or type to search...">
+    <!-- A textarea, not an input: an input silently strips newlines from a
+         pasted list, which turned "one per line" into a single number. -->
+    <textarea id="omni" rows="1" spellcheck="false"
+              placeholder="Paste vault URLs / IDs, one per line — or type to search..."></textarea>
     <button id="add-btn" class="accent">Add</button>
   </section>
 
@@ -43,8 +45,10 @@
   <section class="runbar">
     <button id="start-btn" class="start" disabled>Start</button>
     <span class="grow"></span>
-    <button id="pause-btn" class="warn ghost-border" disabled>Pause</button>
-    <button id="stop-btn" class="danger ghost-border" disabled>Stop</button>
+    <button id="pause-btn" class="warn ghost-border" disabled
+            title="Stop after the current chunk. Partial files are kept, and Start resumes exactly where it left off.">Pause</button>
+    <button id="stop-btn" class="danger ghost-border"
+            title="Stop and discard partial downloads so the next run starts clean. Asks first.">Stop</button>
     <button id="clear-btn" class="ghost-border">Clear</button>
   </section>
 
@@ -59,14 +63,26 @@
     <div id="active-list" class="cards"></div>
   </section>
 
-  <section>
+  <section id="queued-section" class="hidden">
     <div class="section-head">
+      <span class="section-label">QUEUED</span>
+      <span class="grow"></span>
+      <span id="queued-count" class="badge">0</span>
+    </div>
+    <div id="queued-list" class="rows"></div>
+  </section>
+
+  <section>
+    <div class="section-head clickable" id="history-toggle">
       <span class="section-label">HISTORY</span>
       <span id="history-count" class="badge">0</span>
       <span class="grow"></span>
       <button id="convert-all" class="pill">CONVERT ALL</button>
+      <span id="history-caret" class="badge">▸</span>
     </div>
-    <div id="history-list" class="cards"></div>
+    <!-- Collapsed on load: finished games are for looking back at, not for
+         pushing the current download off the screen. -->
+    <div id="history-list" class="cards hidden"></div>
   </section>
 
   <section id="log-section">
@@ -77,6 +93,23 @@
     </div>
     <pre id="log" class="log hidden"></pre>
   </section>
+
+  <!-- ===== the run asks, but only if you turned "ask me" on in settings ==== -->
+  <div id="prompt-modal" class="modal hidden">
+    <div class="modal-inner">
+      <div class="panel-head">
+        <span id="prompt-head" class="section-label">CHOOSE DISCS</span>
+      </div>
+      <div id="prompt-title" class="scan-title"></div>
+      <p id="prompt-hint" class="hint"></p>
+      <div id="prompt-body" class="discs-list"></div>
+      <div class="scan-foot">
+        <button id="prompt-skip" class="ghost-border">Skip this game</button>
+        <span class="grow"></span>
+        <button id="prompt-go" class="accent">Download these</button>
+      </div>
+    </div>
+  </div>
 
   <!-- ================= settings drawer ================= -->
   <div id="settings-panel" class="drawer hidden">
@@ -97,13 +130,7 @@
       <label>Preferred regions <span class="hint">affects version choice and search order</span>
         <input id="set-prefer" type="text" placeholder="USA, Europe, Japan" spellcheck="false">
       </label>
-      <div class="row3">
-        <label>Revision
-          <select id="set-policy">
-            <option value="latest">latest</option>
-            <option value="first">first</option>
-          </select>
-        </label>
+      <div class="row2">
         <label>Delay (s)
           <input id="set-delay" type="number" min="1" max="120" step="1">
         </label>
@@ -119,6 +146,59 @@
       <label>Cookies file <span class="hint">optional, for files that need an account</span>
         <input id="set-cookies" type="text" spellcheck="false">
       </label>
+
+      <div class="subhead">VERSIONS</div>
+      <div class="row2">
+        <label>Revision <span class="hint">when a game has several</span>
+          <select id="set-policy">
+            <option value="latest">latest</option>
+            <option value="first">first</option>
+            <option value="ask">ask me</option>
+          </select>
+        </label>
+        <label>Discs <span class="hint">for multi-disc games</span>
+          <select id="set-discpolicy">
+            <option value="all">all</option>
+            <option value="ask">ask me</option>
+          </select>
+        </label>
+      </div>
+      <span class="hint">"ask me" stops the run at that game and waits for you,
+        so leave it on "all" for unattended downloads.</span>
+
+      <div class="subhead">FORMATS</div>
+      <span class="hint">Which download to take where the site offers a choice.
+        These start on Vimm's own default; .rvz is smaller but only works in
+        Dolphin, and .xiso.iso only in Xbox emulators.</span>
+      <div class="row2">
+        <label>GameCube
+          <select id="set-fmt-gc">
+            <option value=".ciso">.ciso</option>
+            <option value=".nkit.iso">.nkit.iso</option>
+            <option value=".rvz">.rvz</option>
+          </select>
+        </label>
+        <label>Wii
+          <select id="set-fmt-wii">
+            <option value=".wbfs">.wbfs</option>
+            <option value=".rvz">.rvz</option>
+          </select>
+        </label>
+      </div>
+      <div class="row2">
+        <label>Xbox
+          <select id="set-fmt-xbox">
+            <option value=".xiso.iso">.xiso.iso</option>
+            <option value=".iso">.iso</option>
+          </select>
+        </label>
+        <label>PS3
+          <select id="set-fmt-ps3">
+            <option value="JB Folder">JB Folder</option>
+            <option value=".dec.iso">.dec.iso</option>
+          </select>
+        </label>
+      </div>
 
       <div class="subhead">SEARCH FILTER</div>
       <div id="tag-filters" class="taglist"></div>

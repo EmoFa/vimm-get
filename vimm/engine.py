@@ -161,6 +161,9 @@ class VaultPage:
     title: str
     download_host: str  # e.g. "https://dl3.vimm.net/"
     media: list[Media] = field(default_factory=list)
+    # Download formats the page offers, indexed by `alt` - the site's own
+    # chooser, e.g. [".wbfs", ".rvz"]. Empty on single-format systems.
+    formats: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -220,6 +223,13 @@ class Listener:
 
     def page_resolved(self, page: VaultPage) -> None: ...
 
+    def item_plan(self, vault_id: int, downloads: int) -> None:
+        """How many files this game will produce - one per chosen disc.
+
+        `item_done` fires once per *file*, so without this a front-end cannot
+        tell disc 1 of 3 finishing from the whole game finishing.
+        """
+
     def status(self, text: str) -> None:
         """An informational line about the current item."""
 
@@ -251,6 +261,14 @@ class Listener:
                         alt_of) -> list[Media]:
         """Called when `pick` is set and a disc has several versions."""
         return candidates[:1]
+
+    def choose_discs(self, page: VaultPage, discs: list[int]) -> list[int]:
+        """Called when `ask_discs` is set and a game has several discs.
+
+        Returning every disc is the same answer the default policy gives, so
+        a front-end that does not implement this changes nothing.
+        """
+        return list(discs)
 
 
 class _Meter:
@@ -316,7 +334,16 @@ def parse_id_lines(lines, source: str = "input", warn=None) -> list[int]:
             if warn:
                 warn(f"{source}:{lineno}: cannot read an ID from {raw.strip()!r}")
             continue
-        vault_id = int(match.group(1))
+        digits = match.group(1)
+        # Real vault IDs are six digits or so. Anything wildly longer is not
+        # an ID - most likely a list that lost its line breaks somewhere and
+        # ran together into one number.
+        if len(digits) > 8:
+            if warn:
+                warn(f"{source}:{lineno}: {digits[:12]}... is too long to be a "
+                     f"vault ID - is this several IDs run together?")
+            continue
+        vault_id = int(digits)
         if vault_id in seen:
             continue
         seen.add(vault_id)
@@ -365,6 +392,37 @@ def _int_kb(value) -> int:
         return int(str(value).strip() or 0) * 1024
     except (TypeError, ValueError):
         return 0
+
+
+_FORMAT_SELECT = re.compile(
+    r'<select[^>]*\bid=["\']dl_format["\'][^>]*>(.*?)</select>', re.S | re.I)
+_FORMAT_OPTION = re.compile(
+    r'<option[^>]*\bvalue=["\'](\d+)["\'][^>]*>(.*?)</option>', re.S | re.I)
+
+
+def parse_formats(page_html: str) -> list[str]:
+    """The download formats a page offers, indexed by `alt`.
+
+    The site publishes this itself as `<select id="dl_format">`, where each
+    option's value *is* the alt index the download URL wants - so this is the
+    authoritative mapping rather than a guess. Verified live: GameCube offers
+    .ciso/.nkit.iso/.rvz, Wii .wbfs/.rvz, Xbox .xiso.iso/.iso, PS3 JB
+    Folder/.dec.iso; PS2 and the cartridge systems have no select at all.
+
+    `Mirror[]` in the media JSON cannot be used for this - only GameCube
+    names its formats there, while Wii, Xbox and PS3 report one name for two
+    genuinely different downloads.
+    """
+    block = _FORMAT_SELECT.search(page_html)
+    if not block:
+        return []
+    labels: dict[int, str] = {}
+    for value, text in _FORMAT_OPTION.findall(block.group(1)):
+        clean = html.unescape(re.sub(r"<[^>]+>", "", text))
+        labels[int(value)] = " ".join(clean.split())
+    if not labels:
+        return []
+    return [labels.get(alt, "") for alt in range(max(labels) + 1)]
 
 
 def parse_vault_page(vault_id: int, page_html: str) -> VaultPage:
@@ -430,7 +488,8 @@ def parse_vault_page(vault_id: int, page_html: str) -> VaultPage:
     if not media:
         raise VimmError("vault page lists no media")
 
-    return VaultPage(vault_id=vault_id, title=title, download_host=action, media=media)
+    return VaultPage(vault_id=vault_id, title=title, download_host=action,
+                     media=media, formats=parse_formats(page_html))
 
 
 def filename_from_disposition(header: str | None) -> str | None:
@@ -1050,19 +1109,34 @@ def _preference_rank(media: Media, prefer: list[str]) -> int:
     return len(prefer)
 
 
-def choose_format(media: Media, requested: str | None) -> int:
-    """Resolve the `format` option to an `alt` index for this entry."""
-    if requested is None:
+def choose_format(media: Media, requested: str | None,
+                  labels: list[str] | None = None) -> int:
+    """Resolve a requested format to an `alt` index for this entry.
+
+    `labels` is the page's own format list (`VaultPage.formats`) and is tried
+    first, since for Wii, Xbox and PS3 it is the only place the formats are
+    named. Falls back to the entry's `Mirror[]` names, which only GameCube
+    fills in usefully.
+
+    Anything unrecognised, or an alt the site has no file for, resolves to 0 -
+    the site's own default. That matters: `select_media` drops media whose
+    chosen alt is empty, so a game missing the preferred format must fall back
+    to the normal download rather than be skipped entirely.
+    """
+    if not requested:
         return 0
-    if requested.isdigit():
-        alt = int(requested)
+    wanted = requested.strip().lower()
+    if wanted.isdigit():
+        alt = int(wanted)
         return alt if media.size(alt) > 0 else 0
-    for alt, name in enumerate(media.formats):
-        if name.lower() == requested.lower() and media.size(alt) > 0:
-            return alt
-    for alt, name in enumerate(media.formats):
-        if requested.lower() in name.lower() and media.size(alt) > 0:
-            return alt
+
+    for names in (labels or [], media.formats):
+        for alt, name in enumerate(names):
+            if name.lower() == wanted and media.size(alt) > 0:
+                return alt
+        for alt, name in enumerate(names):
+            if name and wanted in name.lower() and media.size(alt) > 0:
+                return alt
     return 0
 
 
@@ -1088,7 +1162,19 @@ def select_media(
     for media in page.media:
         by_disc.setdefault(media.disc, []).append(media)
 
-    alt_of = lambda m: choose_format(m, opts.format)  # noqa: E731
+    # Only ask when there is genuinely something to choose, and never when a
+    # choice has already been made for this game in the queue.
+    if (wanted_discs is None and getattr(opts, "ask_discs", False)
+            and len(by_disc) > 1):
+        wanted_discs = {int(d) for d in listener.choose_discs(page, sorted(by_disc))}
+
+    # Which format to take is a per-system preference: GameCube and Wii offer
+    # .rvz, Xbox a trimmed .xiso.iso, PS3 a JB folder or a decrypted ISO. A
+    # system with no preference set keeps the site's own default of alt 0.
+    per_system = getattr(opts, "formats", None) or {}
+    system = system_folder(page.title, getattr(opts, "folders", None))
+    requested = per_system.get(system) or opts.format
+    alt_of = lambda m: choose_format(m, requested, page.formats)  # noqa: E731
     selected: list[tuple[Media, int]] = []
 
     for disc in sorted(by_disc):
@@ -1145,6 +1231,9 @@ DEFAULTS = {
     "sweeps": 10,
     "prefer": [],
     "format": None,
+    # Per-system format preference, keyed by folder name, e.g.
+    # {"gc": ".rvz", "ps3": ".dec.iso"}. Beats `format` for those systems.
+    "formats": {},
     "discs": "all",
     "version_policy": "latest",
     "cookies": None,
@@ -1162,7 +1251,10 @@ DEFAULTS = {
 
 
 # Run-shape flags that are not download settings but are read by run code.
-_RUN_FLAGS = {"all_versions": False, "pick": False, "list": False}
+_RUN_FLAGS = {"all_versions": False, "pick": False, "list": False,
+              # Ask which discs to take when a game has several, instead of
+              # quietly taking them all. Off unless the user turns it on.
+              "ask_discs": False}
 
 
 def make_options(**overrides) -> argparse.Namespace:
@@ -1244,9 +1336,16 @@ def run_pass(
     opts: argparse.Namespace,
     client: VimmClient,
     label: str = "",
+    pages: dict[int, VaultPage] | None = None,
 ) -> list[Result]:
     """One pass over the ID list. Safe to repeat: finished files are skipped
-    and partial ones resume, so a second pass only does outstanding work."""
+    and partial ones resume, so a second pass only does outstanding work.
+
+    `pages` is a shared cache of already-fetched vault pages. A front-end that
+    has looked a game up (to show its discs, say) passes it in so the page is
+    not requested a second time; pages fetched here are added to it. One page
+    view per game keeps well clear of the site's rate limit.
+    """
     listener = client.listener
     results: list[Result] = []
     downloads_done = 0
@@ -1255,7 +1354,11 @@ def run_pass(
         client._check_cancelled()
         listener.item_started(index, len(vault_ids), vault_id, label)
         try:
-            page = client.fetch_vault(vault_id)
+            page = pages.get(vault_id) if pages is not None else None
+            if page is None:
+                page = client.fetch_vault(vault_id)
+                if pages is not None:
+                    pages[vault_id] = page
         except VimmError as exc:
             listener.status(f"FAIL  {exc}")
             result = Result(vault_id, "?", "", "failed", 0, str(exc))
@@ -1272,6 +1375,7 @@ def run_pass(
             listener.item_done(result)
             continue
 
+        listener.item_plan(vault_id, len(selections))
         dest_dir = destination_for(page, opts, listener)
         for disc_index, (media, alt) in enumerate(selections):
             if opts.list:
@@ -1314,6 +1418,7 @@ def run_http(
     opts: argparse.Namespace,
     listener: Listener | None = None,
     cancel_event: threading.Event | None = None,
+    pages: dict[int, VaultPage] | None = None,
 ) -> list[Result]:
     listener = listener or Listener()
     client = VimmClient(opts, listener=listener, cancel_event=cancel_event)
@@ -1324,7 +1429,7 @@ def run_http(
             raise VimmError(f"Cookie file not found: {cookie_path}")
         listener.status(f"cookies: {load_cookies(client.session, cookie_path)}")
 
-    results = run_pass(vault_ids, opts, client)
+    results = run_pass(vault_ids, opts, client, pages=pages)
     if opts.list or opts.sweeps <= 0:
         return results
 
@@ -1346,7 +1451,8 @@ def run_http(
         before = sum(r.partial for rs in final.values() for r in rs)
         listener.sweep_started(sweep, len(pending))
 
-        swept = run_pass(pending, opts, client, label=f"sweep {sweep} ")
+        swept = run_pass(pending, opts, client, label=f"sweep {sweep} ",
+                         pages=pages)
         for r in swept:
             final[r.vault_id] = [x for x in final[r.vault_id] if x.status != "failed"]
             final[r.vault_id].append(r)

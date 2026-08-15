@@ -148,13 +148,15 @@ with client:  # runs startup so hub.loop exists
         check("run finished over WS", finished, hub.run_status)
         check("progress events over WS", saw_progress)
 
-    item = hub.queue[0]
-    check("item done after mid-stream kill (resume worked)", item["status"] == "done",
-          item["message"])
+    # A finished game leaves the queue for the history, so that is where the
+    # mid-stream kill is confirmed to have resumed rather than restarted: the
+    # archive is whole, not truncated or doubled.
+    check("item left the queue once done", hub.queue == [], str(hub.queue))
     check("history entry created", len(hub.history) == 1)
     entry = hub.history[0]
     archive = Path(entry["files"][0]["archive"])
-    check("archive on disk", archive.is_file() and archive.stat().st_size == len(ZIP))
+    check("archive on disk after mid-stream kill (resume worked)",
+          archive.is_file() and archive.stat().st_size == len(ZIP))
 
     # manual extract stage through the API
     r = client.post(f"/api/items/{entry['key']}/extract")
