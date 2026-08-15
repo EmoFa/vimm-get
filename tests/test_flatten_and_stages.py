@@ -93,10 +93,17 @@ def entry(**stages):
 
 check("downloaded only -> no compress, no m3u",
       not hub.can_chd(entry()) and not hub.can_m3u(entry()))
+hub.settings["auto_compress"] = True
 check("extracted -> compress yes, m3u not yet",
       hub.can_chd(entry(extracted=True)) and not hub.can_m3u(entry(extracted=True)))
 check("compressed -> m3u unlocks",
       hub.can_m3u(entry(extracted=True, chd=True)))
+# With compression switched off there is nothing to wait for, so the playlist
+# is built over the cue sheets rather than never at all.
+hub.settings["auto_compress"] = False
+check("compression off -> m3u unlocks without it",
+      hub.can_m3u(entry(extracted=True)))
+hub.settings["auto_compress"] = True
 check("single-disc game never offers m3u",
       not hub.can_m3u({"system_folder": "psx",
                        "files": [{"archive": "a.7z"}],

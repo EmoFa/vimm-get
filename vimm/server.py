@@ -178,6 +178,9 @@ class Hub:
         # throw the partial downloads away rather than keep them.
         self._discard_on_stop = False
         self._pages: dict[int, object] = {}   # vault_id -> VaultPage
+        # vault_id -> how many files the current run means to fetch for it.
+        # The playlist stage waits on this; nothing else may.
+        self._expected_discs: dict[int, int] = {}
         self._opts = None
 
         # Entry keys currently being driven through every stage by Convert
@@ -626,27 +629,63 @@ class Hub:
 
     # -------------------------------------------------------------- history
 
+    def is_chd_system(self, entry: dict) -> bool:
+        """Whether this game's system is one we compress at all."""
+        systems = [s.lower() for s in self.settings.get("chd_systems", [])]
+        return entry.get("system_folder", "").lower() in systems
+
     def can_chd(self, entry: dict) -> bool:
         """Whether the COMPRESS action is offerable right now.
 
         Includes "not already done", so the flag alone decides the button and
         callers cannot disagree about what it means.
         """
-        systems = [s.lower() for s in self.settings.get("chd_systems", [])]
         stages = entry.get("stages", {})
-        return (entry.get("system_folder", "").lower() in systems
+        return (self.is_chd_system(entry)
                 and bool(stages.get("extracted"))
                 and not stages.get("chd"))
 
+    def compression_outstanding(self, entry: dict) -> bool:
+        """Whether this game is still meant to be compressed.
+
+        False when the system does not use CHD, or compression is switched
+        off - which is what lets a playlist be built over bin+cue files
+        instead of waiting forever for a conversion that is never coming.
+        """
+        if not self.is_chd_system(entry) or not self.settings.get("auto_compress"):
+            return False
+        if entry.get("stages", {}).get("chd"):
+            return False
+        files = self.entry_files(entry)
+        # With nothing on disk to judge by, trust the stage flag above: the
+        # conversion has not happened. With files, ask them - a game that
+        # arrived with no cue or gdi has nothing to wait for.
+        return not files or bool(chd_mod.compressible_among(files))
+
+    def all_discs_present(self, entry: dict) -> bool:
+        """Every disc this run means to fetch has arrived.
+
+        Unknown - a restart, or an entry predating the run - means there is
+        nothing to wait for.
+        """
+        expected = entry.get("discs_expected") or 0
+        return len(entry.get("files", [])) >= expected
+
     def can_m3u(self, entry: dict) -> bool:
-        """Playlists come last: the discs have to be compressed first, so the
-        playlist lists .chd files rather than cue sheets that would be
-        replaced moments later."""
+        """Playlists come last, once the whole game is settled.
+
+        Every disc downloaded, every archive unpacked, and nothing left to
+        compress that we mean to compress - so the playlist lists .chd files
+        rather than cue sheets about to be replaced, and a half-downloaded
+        game is never folded away.
+        """
         systems = [s.lower() for s in self.settings.get("m3u_systems", [])]
         stages = entry.get("stages", {})
         return (entry.get("system_folder", "").lower() in systems
                 and len(entry.get("files", [])) > 1
-                and bool(stages.get("chd"))
+                and bool(stages.get("extracted"))
+                and self.all_discs_present(entry)
+                and not self.compression_outstanding(entry)
                 and not stages.get("m3u"))
 
     def decorate(self, entry: dict) -> dict:
@@ -663,6 +702,12 @@ class Hub:
         folder = system_folder(page.title, getattr(self._opts, "folders", None))
         archive = str(Path(dest) / result.filename)
 
+        # The real disc number, from the page we already hold. Counting rows
+        # gets this wrong whenever a disc is re-recorded or only a subset was
+        # chosen - picking discs 1 and 3 would file them as 1 and 2.
+        disc_no = next((m.disc for m in page.media
+                        if m.media_id == result.media_id), 0)
+
         with self._lock:
             entry = next((h for h in self.history
                           if h["vault_id"] == result.vault_id), None)
@@ -674,11 +719,21 @@ class Hub:
                     "system_folder": folder if self._opts.organize else "",
                     "dir": str(dest),
                     "files": [],
-                    "stages": {"archive": True, "extracted": False,
-                               "chd": False, "m3u": False},
+                    "stages": {},
                     "when": time.time(),
                 }
                 self.history.insert(0, entry)
+            entry["dir"] = str(dest)
+            # A newly downloaded archive means there is work to do again, so
+            # the post-processing flags re-open. Without this a re-download
+            # inherits "already extracted, already compressed, already
+            # playlisted" from the previous run and the whole chain declines
+            # to start. It is equally right mid-run: disc 2 arriving after
+            # disc 1 has been compressed does leave compression outstanding.
+            entry["stages"] = {"archive": True, "extracted": False,
+                               "chd": False, "m3u": False}
+            if self._expected_discs.get(result.vault_id):
+                entry["discs_expected"] = self._expected_discs[result.vault_id]
             # Re-downloading the same disc replaces its row rather than
             # adding a duplicate.
             entry["files"] = [f for f in entry["files"]
@@ -687,9 +742,10 @@ class Hub:
                 "filename": result.filename,
                 "archive": archive,
                 "bytes": result.bytes,
-                "disc": len(entry["files"]) + 1,
+                "disc": disc_no or len(entry["files"]) + 1,
                 "message": result.message,
             })
+            entry["files"].sort(key=lambda f: f.get("disc", 0))
             _save_json(DATA_DIR / "history.json", self.history)
 
         self.emit({"type": "history_item", "item": self.decorate(entry)})
@@ -748,7 +804,13 @@ class Hub:
 
     # ------------------------------------------------------------- stages
 
-    def submit_stage(self, entry: dict, kind: str) -> Job | None:
+    def submit_stage(self, entry: dict, kind: str, only=None) -> Job | None:
+        """`only` names specific files to work on.
+
+        Used to compress one disc the moment it is extracted, without waiting
+        for its siblings - so it skips the game-level "everything is
+        extracted" precondition, which is exactly what is not yet true then.
+        """
         item_dir = Path(entry["dir"])
         if kind == "extract":
             archives = [Path(f["archive"]) for f in entry.get("files", [])
@@ -763,6 +825,11 @@ class Hub:
                     item_key=entry["key"])) or submitted
             return submitted
         if kind == "chd":
+            if only is not None:
+                sheets = chd_mod.compressible_among([Path(p) for p in only])
+                if not sheets:
+                    return None
+                return self._submit_chd(entry, sheets)
             if not self.can_chd(entry):
                 self.log(f"! CHD is not applicable to {entry['title']}")
                 return None
@@ -777,14 +844,7 @@ class Hub:
                 else:
                     self.log(f"! no .cue/.gdi to compress for {entry['title']}")
                 return None
-            submitted = None
-            for sheet in sheets:
-                submitted = self.pipeline.submit(Job(
-                    kind="chd", label=sheet.name, target=sheet,
-                    item_key=entry["key"],
-                    extra={"delete_sources": bool(self.settings["delete_chd_sources"])}
-                )) or submitted
-            return submitted
+            return self._submit_chd(entry, sheets)
         if kind == "m3u":
             if not self.can_m3u(entry):
                 self.log(f"! m3u is not applicable to {entry['title']}")
@@ -799,6 +859,16 @@ class Hub:
                        "files": [str(p) for p in self.entry_files(entry)]}))
         return None
 
+    def _submit_chd(self, entry: dict, sheets) -> Job | None:
+        submitted = None
+        for sheet in sheets:
+            submitted = self.pipeline.submit(Job(
+                kind="chd", label=sheet.name, target=sheet,
+                item_key=entry["key"],
+                extra={"delete_sources": bool(self.settings["delete_chd_sources"])}
+            )) or submitted
+        return submitted
+
     def _mark_stage(self, entry: dict, stage: str) -> None:
         entry.setdefault("stages", {})[stage] = True
         self.save_history()
@@ -811,12 +881,20 @@ class Hub:
         otherwise the auto_* settings decide whether to continue.
         """
         stages = entry.get("stages", {})
+        # A stage that is applicable but switched off falls through to the
+        # next one rather than ending the chain. Returning None here is what
+        # stopped a playlist ever being built with compression turned off:
+        # CHD was applicable, unwanted, and the m3u step below was never
+        # reached.
         if not stages.get("extracted"):
-            return "extract" if (forced or self.settings["auto_extract"]) else None
+            if forced or self.settings["auto_extract"]:
+                return "extract"
         if self.can_chd(entry) and not stages.get("chd"):
-            return "chd" if (forced or self.settings["auto_compress"]) else None
+            if forced or self.settings["auto_compress"]:
+                return "chd"
         if self.can_m3u(entry) and not stages.get("m3u"):
-            return "m3u" if (forced or self.settings["auto_m3u"]) else None
+            if forced or self.settings["auto_m3u"]:
+                return "m3u"
         return None
 
     def convert_all(self) -> int:
@@ -872,7 +950,16 @@ class Hub:
         if job.status == "done":
             if job.kind == "extract":
                 # Everything this archive produced belongs to this game.
-                self.track_files(entry, job.extra.get("extracted", []))
+                produced = job.extra.get("extracted", [])
+                self.track_files(entry, produced)
+                # Compress this disc now, while the next one downloads,
+                # rather than waiting for the whole game to be unpacked.
+                # Scoped to what this job produced, so the sheets of discs
+                # that have not arrived yet are simply not there to submit.
+                if (self.settings.get("auto_compress")
+                        and self.is_chd_system(entry)
+                        and not entry["stages"].get("chd")):
+                    self.submit_stage(entry, "chd", only=produced)
                 # Only mark the game extracted once no archive remains.
                 remaining = [f for f in entry.get("files", [])
                              if Path(f["archive"]).is_file()]
@@ -1007,6 +1094,8 @@ class WebListener(Listener):
 
     def item_plan(self, vault_id: int, downloads: int):
         self._plan[vault_id] = {"left": downloads, "failed": 0}
+        # The playlist stage waits for all of them, and only it does.
+        self.hub._expected_discs[vault_id] = downloads
 
     def item_done(self, result: Result):
         plan = self._plan.get(result.vault_id)
@@ -1016,6 +1105,13 @@ class WebListener(Listener):
                 plan["failed"] += 1
 
         entry = self.hub.add_history(result)
+        # Unpack this disc straight away, so it is extracted and compressed
+        # while the next one downloads. The pipeline runs on its own thread
+        # and de-duplicates by target, so re-submitting per disc costs
+        # nothing and queues nothing twice. Only the playlist waits for the
+        # whole game.
+        if entry is not None and self.hub.settings["auto_extract"]:
+            self.hub.submit_stage(entry, "extract")
 
         if plan is not None and plan["left"] > 0 and result.status == "ok":
             # One disc of several. The game is not finished, so its row stays
@@ -1027,17 +1123,6 @@ class WebListener(Listener):
                 waiting_until=0,
                 message=f"disc done, {remaining} more to go")
             return
-
-        # Every chosen disc has arrived, so post-processing can begin - and
-        # not one moment sooner. Extraction declares a game extracted once no
-        # archive is left to unpack, which after disc 1 of 2 is perfectly
-        # true and completely wrong: CHD would then compress the only disc it
-        # could see, mark itself done, and the playlist would be built from
-        # half a game. Nothing here is per-disc; `submit_stage` picks up every
-        # archive the entry has.
-        if (entry is not None and self.hub.settings["auto_extract"]
-                and (plan is None or plan["failed"] == 0)):
-            self.hub.submit_stage(entry, "extract")
 
         status_map = {"ok": "done", "skipped": "skipped", "failed": "failed",
                       "listed": "listed"}
