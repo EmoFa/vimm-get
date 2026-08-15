@@ -284,6 +284,37 @@ button:disabled { opacity: .35; cursor: default; filter: none; }
   font-family: var(--mono); font-size: 11.5px; color: var(--text-faint);
 }
 
+/* ---------------------------------------------------------------- modals */
+/* Centred, unlike the settings drawer: these interrupt Start, so they belong
+   in front of you rather than off to one side. */
+.modal {
+  position: fixed; inset: 0; background: rgba(8,6,12,.74);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+  padding: 20px;
+}
+.modal-inner {
+  width: min(560px, 100%); max-height: 84vh; overflow-y: auto;
+  background: var(--bg-card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 4px 22px 20px;
+}
+.scan-title {
+  font-family: var(--mono); font-size: 12.5px; color: var(--text-dim);
+  margin-top: 8px; min-height: 17px; word-break: break-all;
+}
+.scan-foot { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
+.scan-wait {
+  margin-top: 12px; padding: 9px 11px; border-radius: 8px;
+  background: var(--bg-inset); border: 1px solid var(--violet);
+  font-family: var(--mono); font-size: 11.5px; color: var(--violet);
+}
+.discs-list { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.discs-game { border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.discs-game:first-child { border-top: 0; }
+.discs-game .g-title { font-size: 13px; color: var(--text); }
+/* The chips already carry their own top border inside a queue row, which
+   would double up with the one separating games here. */
+.discs-game .discs { border-top: 0; padding-top: 6px; margin-top: 2px; }
+
 .drawer {
   position: fixed; inset: 0; background: rgba(8,6,12,.74);
   display: flex; justify-content: flex-end; z-index: 40;
@@ -318,11 +349,13 @@ button:disabled { opacity: .35; cursor: default; filter: none; }
   color: var(--text-faint); margin-top: 26px; margin-bottom: 2px;
 }
 /* Bottom-align so the inputs line up even when a label wraps. */
-.row3 {
-  display: grid; grid-template-columns: repeat(3, 1fr);
-  gap: 10px; align-items: end; margin-top: 16px;
+.row2, .row3 {
+  display: grid; gap: 10px; align-items: end; margin-top: 16px;
 }
-.row3 label { margin-top: 0; }
+.row2 { grid-template-columns: repeat(2, 1fr); }
+.row3 { grid-template-columns: repeat(3, 1fr); }
+.row2 label, .row3 label { margin-top: 0; }
+.row2 select, .row2 input,
 .row3 select, .row3 input { height: 38px; }
 /* No gap here - the rows carry their own margin, and adding both is what
    made this list sit wider apart than the automation list below it. */

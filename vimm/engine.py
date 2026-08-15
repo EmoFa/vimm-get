@@ -161,6 +161,9 @@ class VaultPage:
     title: str
     download_host: str  # e.g. "https://dl3.vimm.net/"
     media: list[Media] = field(default_factory=list)
+    # Download formats the page offers, indexed by `alt` - the site's own
+    # chooser, e.g. [".wbfs", ".rvz"]. Empty on single-format systems.
+    formats: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -220,6 +223,13 @@ class Listener:
 
     def page_resolved(self, page: VaultPage) -> None: ...
 
+    def item_plan(self, vault_id: int, downloads: int) -> None:
+        """How many files this game will produce - one per chosen disc.
+
+        `item_done` fires once per *file*, so without this a front-end cannot
+        tell disc 1 of 3 finishing from the whole game finishing.
+        """
+
     def status(self, text: str) -> None:
         """An informational line about the current item."""
 
@@ -251,6 +261,14 @@ class Listener:
                         alt_of) -> list[Media]:
         """Called when `pick` is set and a disc has several versions."""
         return candidates[:1]
+
+    def choose_discs(self, page: VaultPage, discs: list[int]) -> list[int]:
+        """Called when `ask_discs` is set and a game has several discs.
+
+        Returning every disc is the same answer the default policy gives, so
+        a front-end that does not implement this changes nothing.
+        """
+        return list(discs)
 
 
 class _Meter:
@@ -376,6 +394,37 @@ def _int_kb(value) -> int:
         return 0
 
 
+_FORMAT_SELECT = re.compile(
+    r'<select[^>]*\bid=["\']dl_format["\'][^>]*>(.*?)</select>', re.S | re.I)
+_FORMAT_OPTION = re.compile(
+    r'<option[^>]*\bvalue=["\'](\d+)["\'][^>]*>(.*?)</option>', re.S | re.I)
+
+
+def parse_formats(page_html: str) -> list[str]:
+    """The download formats a page offers, indexed by `alt`.
+
+    The site publishes this itself as `<select id="dl_format">`, where each
+    option's value *is* the alt index the download URL wants - so this is the
+    authoritative mapping rather than a guess. Verified live: GameCube offers
+    .ciso/.nkit.iso/.rvz, Wii .wbfs/.rvz, Xbox .xiso.iso/.iso, PS3 JB
+    Folder/.dec.iso; PS2 and the cartridge systems have no select at all.
+
+    `Mirror[]` in the media JSON cannot be used for this - only GameCube
+    names its formats there, while Wii, Xbox and PS3 report one name for two
+    genuinely different downloads.
+    """
+    block = _FORMAT_SELECT.search(page_html)
+    if not block:
+        return []
+    labels: dict[int, str] = {}
+    for value, text in _FORMAT_OPTION.findall(block.group(1)):
+        clean = html.unescape(re.sub(r"<[^>]+>", "", text))
+        labels[int(value)] = " ".join(clean.split())
+    if not labels:
+        return []
+    return [labels.get(alt, "") for alt in range(max(labels) + 1)]
+
+
 def parse_vault_page(vault_id: int, page_html: str) -> VaultPage:
     title_match = re.search(r"<title>(.*?)</title>", page_html, re.S | re.I)
     title = html.unescape(title_match.group(1).strip()) if title_match else f"vault/{vault_id}"
@@ -439,7 +488,8 @@ def parse_vault_page(vault_id: int, page_html: str) -> VaultPage:
     if not media:
         raise VimmError("vault page lists no media")
 
-    return VaultPage(vault_id=vault_id, title=title, download_host=action, media=media)
+    return VaultPage(vault_id=vault_id, title=title, download_host=action,
+                     media=media, formats=parse_formats(page_html))
 
 
 def filename_from_disposition(header: str | None) -> str | None:
@@ -1059,19 +1109,34 @@ def _preference_rank(media: Media, prefer: list[str]) -> int:
     return len(prefer)
 
 
-def choose_format(media: Media, requested: str | None) -> int:
-    """Resolve the `format` option to an `alt` index for this entry."""
-    if requested is None:
+def choose_format(media: Media, requested: str | None,
+                  labels: list[str] | None = None) -> int:
+    """Resolve a requested format to an `alt` index for this entry.
+
+    `labels` is the page's own format list (`VaultPage.formats`) and is tried
+    first, since for Wii, Xbox and PS3 it is the only place the formats are
+    named. Falls back to the entry's `Mirror[]` names, which only GameCube
+    fills in usefully.
+
+    Anything unrecognised, or an alt the site has no file for, resolves to 0 -
+    the site's own default. That matters: `select_media` drops media whose
+    chosen alt is empty, so a game missing the preferred format must fall back
+    to the normal download rather than be skipped entirely.
+    """
+    if not requested:
         return 0
-    if requested.isdigit():
-        alt = int(requested)
+    wanted = requested.strip().lower()
+    if wanted.isdigit():
+        alt = int(wanted)
         return alt if media.size(alt) > 0 else 0
-    for alt, name in enumerate(media.formats):
-        if name.lower() == requested.lower() and media.size(alt) > 0:
-            return alt
-    for alt, name in enumerate(media.formats):
-        if requested.lower() in name.lower() and media.size(alt) > 0:
-            return alt
+
+    for names in (labels or [], media.formats):
+        for alt, name in enumerate(names):
+            if name.lower() == wanted and media.size(alt) > 0:
+                return alt
+        for alt, name in enumerate(names):
+            if name and wanted in name.lower() and media.size(alt) > 0:
+                return alt
     return 0
 
 
@@ -1097,7 +1162,19 @@ def select_media(
     for media in page.media:
         by_disc.setdefault(media.disc, []).append(media)
 
-    alt_of = lambda m: choose_format(m, opts.format)  # noqa: E731
+    # Only ask when there is genuinely something to choose, and never when a
+    # choice has already been made for this game in the queue.
+    if (wanted_discs is None and getattr(opts, "ask_discs", False)
+            and len(by_disc) > 1):
+        wanted_discs = {int(d) for d in listener.choose_discs(page, sorted(by_disc))}
+
+    # Which format to take is a per-system preference: GameCube and Wii offer
+    # .rvz, Xbox a trimmed .xiso.iso, PS3 a JB folder or a decrypted ISO. A
+    # system with no preference set keeps the site's own default of alt 0.
+    per_system = getattr(opts, "formats", None) or {}
+    system = system_folder(page.title, getattr(opts, "folders", None))
+    requested = per_system.get(system) or opts.format
+    alt_of = lambda m: choose_format(m, requested, page.formats)  # noqa: E731
     selected: list[tuple[Media, int]] = []
 
     for disc in sorted(by_disc):
@@ -1154,6 +1231,9 @@ DEFAULTS = {
     "sweeps": 10,
     "prefer": [],
     "format": None,
+    # Per-system format preference, keyed by folder name, e.g.
+    # {"gc": ".rvz", "ps3": ".dec.iso"}. Beats `format` for those systems.
+    "formats": {},
     "discs": "all",
     "version_policy": "latest",
     "cookies": None,
@@ -1171,7 +1251,10 @@ DEFAULTS = {
 
 
 # Run-shape flags that are not download settings but are read by run code.
-_RUN_FLAGS = {"all_versions": False, "pick": False, "list": False}
+_RUN_FLAGS = {"all_versions": False, "pick": False, "list": False,
+              # Ask which discs to take when a game has several, instead of
+              # quietly taking them all. Off unless the user turns it on.
+              "ask_discs": False}
 
 
 def make_options(**overrides) -> argparse.Namespace:
@@ -1292,6 +1375,7 @@ def run_pass(
             listener.item_done(result)
             continue
 
+        listener.item_plan(vault_id, len(selections))
         dest_dir = destination_for(page, opts, listener)
         for disc_index, (media, alt) in enumerate(selections):
             if opts.list:

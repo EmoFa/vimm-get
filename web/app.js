@@ -15,6 +15,7 @@ const state = {
   log: [],
   tag_vocabulary: [],
   lastHidden: [],
+  prompt: null,   // the question the run is waiting on, if any
 };
 
 /* ------------------------------------------------------------------ api */
@@ -56,6 +57,10 @@ function connectWS() {
       case "queue":
         state.queue = event.queue;
         renderActive();
+        break;
+      case "prompt":
+        state.prompt = event.prompt;
+        renderPrompt();
         break;
       case "run":
         state.run = event.status;
@@ -145,10 +150,18 @@ function discPicker(item) {
     box.disabled = ["downloading", "working", "waiting"].includes(item.status);
     box.onchange = () => {
       disc.selected = box.checked;
+      chip.classList.toggle("on", box.checked);
       const wanted = discs.filter(d => d.selected).map(d => d.disc);
       api("POST", `/api/queue/${item.vault_id}/discs`, { discs: wanted })
-        .catch(alertErr);
-      chip.classList.toggle("on", box.checked);
+        .catch(err => {
+          // The run can reach this game between the click and the request,
+          // and then the server refuses. Put the tick back where it was
+          // rather than showing a choice that was not taken.
+          disc.selected = !box.checked;
+          box.checked = disc.selected;
+          chip.classList.toggle("on", box.checked);
+          alertErr(err);
+        });
     };
     chip.append(box, el("span", null, `Disc ${disc.disc}`));
     if (disc.size_text) chip.append(el("span", "disc-label", disc.size_text));
@@ -519,6 +532,7 @@ const SETTING_FIELDS = {
   organize: ["set-organize", "check"],
   prefer: ["set-prefer", "text"],
   version_policy: ["set-policy", "text"],
+  disc_policy: ["set-discpolicy", "text"],
   delay: ["set-delay", "number"],
   sweeps: ["set-sweeps", "number"],
   cancel_busy: ["set-cancelbusy", "check"],
@@ -529,6 +543,10 @@ const SETTING_FIELDS = {
   delete_chd_sources: ["set-delchd", "check"],
 };
 
+// Per-system download format, keyed by the folder name the server uses.
+const FORMAT_FIELDS = { gc: "set-fmt-gc", wii: "set-fmt-wii",
+                        xbox: "set-fmt-xbox", ps3: "set-fmt-ps3" };
+
 function loadSettingsForm() {
   for (const [key, [id, kind]] of Object.entries(SETTING_FIELDS)) {
     const node = $(id);
@@ -537,6 +555,9 @@ function loadSettingsForm() {
   }
   $("set-m3usystems").value = (state.settings.m3u_systems || []).join(", ");
   $("set-chdsystems").value = (state.settings.chd_systems || []).join(", ");
+  const formats = state.settings.formats || {};
+  for (const [system, id] of Object.entries(FORMAT_FIELDS))
+    if (formats[system]) $(id).value = formats[system];
 
   // Tag filter checkboxes, built from what the site actually uses.
   const box = $("tag-filters");
@@ -567,6 +588,8 @@ async function saveSettings() {
   body.chd_systems = csv("set-chdsystems");
   body.hidden_tags = [...$("tag-filters").querySelectorAll("input:checked")]
     .map(input => input.dataset.tag);
+  body.formats = Object.fromEntries(
+    Object.entries(FORMAT_FIELDS).map(([system, id]) => [system, $(id).value]));
   state.settings = await api("PUT", "/api/settings", body);
   $("settings-panel").classList.add("hidden");
 }
@@ -592,6 +615,78 @@ $("hidden-toggle").onclick = () => {
   $("hidden-toggle").textContent = nowHidden ? "SHOW" : "HIDE";
 };
 
+/* ------------------------------------------------------------- ask me */
+/* Only ever seen by someone who set Revision or Discs to "ask me". The run
+   is stopped at that game and stays stopped until this is answered, so the
+   quick answer - everything ticked, one click - is the default. */
+
+function renderPrompt() {
+  const p = state.prompt;
+  $("prompt-modal").classList.toggle("hidden", !p);
+  if (!p) return;
+
+  $("prompt-title").textContent = p.title || "";
+  const body = $("prompt-body");
+  body.replaceChildren();
+
+  if (p.kind === "discs") {
+    $("prompt-head").textContent = "CHOOSE DISCS";
+    $("prompt-hint").textContent =
+      "This game comes on more than one disc. Untick any you do not want.";
+    const row = el("div", "discs");
+    for (const disc of p.discs) {
+      const chip = el("label", "disc-chip on");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = true;
+      box.dataset.disc = disc.disc;
+      box.onchange = () => chip.classList.toggle("on", box.checked);
+      chip.append(box, el("span", null, `Disc ${disc.disc}`));
+      if (disc.size_text) chip.append(el("span", "disc-label", disc.size_text));
+      row.append(chip);
+    }
+    body.append(row);
+  } else {
+    $("prompt-head").textContent = "CHOOSE A REVISION";
+    $("prompt-hint").textContent =
+      `Disc ${p.disc} has more than one revision. Pick the one to download.`;
+    const row = el("div", "discs");
+    for (const [index, version] of (p.versions || []).entries()) {
+      const chip = el("label", "disc-chip" + (index === 0 ? " on" : ""));
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "prompt-version";
+      radio.checked = index === 0;
+      radio.dataset.mediaId = version.media_id;
+      radio.onchange = () => {
+        for (const other of row.querySelectorAll(".disc-chip"))
+          other.classList.remove("on");
+        chip.classList.add("on");
+      };
+      chip.append(radio, el("span", null, `v${version.version}`));
+      if (version.size_text)
+        chip.append(el("span", "disc-label", version.size_text));
+      row.append(chip);
+    }
+    body.append(row);
+  }
+}
+
+async function answerPrompt(answer) {
+  const p = state.prompt;
+  if (!p) return;
+  state.prompt = null;
+  renderPrompt();
+  try { await api("POST", `/api/prompt/${p.id}`, { answer }); }
+  catch (err) { alertErr(err); }
+}
+
+$("prompt-skip").onclick = () => answerPrompt("skip");
+$("prompt-go").onclick = () => {
+  const boxes = [...$("prompt-body").querySelectorAll("input:checked")];
+  answerPrompt(boxes.map(b => Number(b.dataset.disc ?? b.dataset.mediaId)));
+};
+
 $("start-btn").onclick = () => api("POST", "/api/run/start").catch(alertErr);
 $("pause-btn").onclick = () => api("POST", "/api/run/pause").catch(alertErr);
 // Stop throws partial downloads away - the one destructive action here - so
@@ -612,9 +707,18 @@ $("stop-btn").onclick = async () => {
 };
 $("clear-btn").onclick = () => api("POST", "/api/queue/clear")
   .then(r => { state.queue = r.queue; renderActive(); });
-$("convert-all").onclick = () => api("POST", "/api/convert-all")
-  .then(r => { state.log.push(`convert all: ${r.submitted} job(s) submitted`); renderLog(); })
-  .catch(alertErr);
+// It sits inside the section header, so without this it would collapse the
+// section on the way past.
+$("convert-all").onclick = (event) => {
+  event.stopPropagation();
+  api("POST", "/api/convert-all")
+    .then(r => { state.log.push(`convert all: ${r.submitted} job(s) submitted`); renderLog(); })
+    .catch(alertErr);
+};
+$("history-toggle").onclick = () => {
+  const open = !$("history-list").classList.toggle("hidden");
+  $("history-caret").textContent = open ? "▾" : "▸";
+};
 
 $("site-status").onclick = () => {
   state.site = { state: "checking", detail: "contacting vimm.net...", checked_at: 0 };
@@ -636,5 +740,6 @@ $("log-toggle").onclick = () => $("log").classList.toggle("hidden");
   renderHistory();
   renderSite();
   renderLog();
+  renderPrompt();
   connectWS();
 })();

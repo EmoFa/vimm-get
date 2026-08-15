@@ -165,6 +165,7 @@ with client:
     check("the run reused the cached page, fetching nothing",
           PAGE_HITS == [], str(PAGE_HITS))
     check("the file downloaded", (OUT / "Game 700 (USA).zip").is_file())
+    check("the finished game left the queue", hub.queue == [], str(hub.queue))
 
 # ============================================== a run resolves as it goes
 print("=== an unresolved queue resolves during the run, one fetch each ===")
@@ -180,9 +181,17 @@ with client2:
           hub2.run_status)
     check("three games, three page fetches - no duplicates",
           sorted(PAGE_HITS) == [801, 802, 803], str(PAGE_HITS))
+    # Finished games live in the history now, so the names are checked there
+    # rather than in a queue they have rightly left.
+    check("the queue is empty once everything finished",
+          hub2.queue == [], str(hub2.queue))
+    # History is stored under a DATA_DIR shared by the whole suite, so earlier
+    # sections' downloads are in here too - these three must be present, not
+    # be the only ones.
+    titles = {h["title"] for h in hub2.history}
     check("names filled in from the run",
-          all(q["title"].startswith("Game ") for q in hub2.queue),
-          str([q["title"] for q in hub2.queue]))
+          {"Game 801 (GBC)", "Game 802 (GBC)", "Game 803 (GBC)"} <= titles,
+          str(sorted(titles)))
 
 # ================================================ throttling is not failure
 print("=== a 429 on lookup leaves the game queued, not failed ===")
@@ -234,8 +243,10 @@ for label, pause in (("Pause", True), ("Stop", False)):
             MODE["drip"] = False
             client4.post("/api/run/start")
             check("Pause: Start finishes it",
-                  wait_for(lambda: hub4.queue[0]["status"] == "done", 60),
-                  hub4.queue[0]["status"])
+                  wait_for(lambda: hub4.run_status.startswith("finished"), 60),
+                  hub4.run_status)
+            check("Pause: the finished game left the queue",
+                  hub4.queue == [], str(hub4.queue))
             check("Pause: file is complete and correct",
                   (out / "Game 950 (USA).zip").read_bytes() == ZIP)
             MODE["drip"] = True

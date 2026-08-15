@@ -57,7 +57,19 @@ DEFAULT_SETTINGS = {
     "out": str(Path.home() / "Downloads" / "Vimm"),
     "organize": True,
     "prefer": "USA, Europe",
+    # latest | first | ask - "ask" stops the run to let you choose a revision.
     "version_policy": "latest",
+    # all | ask - "ask" stops the run at each multi-disc game. Off by default:
+    # a multi-disc game is one game, and taking every disc is nearly always
+    # what is wanted.
+    "disc_policy": "all",
+    # Which download the site should give us, per system. These match the
+    # site's own default - the first option in its chooser - so out of the box
+    # you get exactly what vimm.net would hand you. Verified against the live
+    # vault pages: GameCube offers .ciso/.nkit.iso/.rvz, Wii .wbfs/.rvz, Xbox
+    # .xiso.iso/.iso, PS3 JB Folder/.dec.iso.
+    "formats": {"gc": ".ciso", "wii": ".wbfs",
+                "xbox": ".xiso.iso", "ps3": "JB Folder"},
     "delay": 5.0,
     "sweeps": 10,
     "cancel_busy": True,
@@ -139,6 +151,11 @@ class Hub:
                          **_load_json(DATA_DIR / "settings.json", {})}
         self.history: list[dict] = _migrate_history(
             _load_json(DATA_DIR / "history.json", []))
+        # A game's disc structure never changes, so a vault page is worth
+        # looking up once ever. Keyed by vault id (as a string, since that is
+        # what JSON gives back): title, system, size and the disc list.
+        self.vault_cache: dict[str, dict] = _load_json(
+            DATA_DIR / "vault_cache.json", {})
         self.queue: list[dict] = []
         self.run_status = "idle"
         self.log_lines: list[str] = []
@@ -152,6 +169,10 @@ class Hub:
         self._lock = threading.Lock()
 
         self._run_thread: threading.Thread | None = None
+        # The question currently on screen, if the user asked to be asked.
+        self.prompt: dict | None = None
+        self._prompt_event = threading.Event()
+        self._prompt_answer = None
         self._cancel = threading.Event()
         # Set by Stop (as opposed to Pause) so the cancelled run knows to
         # throw the partial downloads away rather than keep them.
@@ -221,23 +242,44 @@ class Hub:
                 if vault_id in existing:
                     continue
                 existing.add(vault_id)
+                size_text = ""
+                discs: list[dict] = []
+                # `scanned` means we know how many discs this game has. It is
+                # not `resolved`, which means we hold the actual page.
+                scanned = False
+
+                meta = self.vault_cache.get(str(vault_id))
+                if meta:
+                    # Seen in some earlier session. Disc structure does not
+                    # change, so the checkboxes can appear right now for free.
+                    title = meta.get("title") or title
+                    system = meta.get("system") or system
+                    size_text = meta.get("size_text", "")
+                    discs = [{**d, "selected": True}
+                             for d in meta.get("discs", [])]
+                    scanned = True
+
                 self.queue.append({
                     "vault_id": vault_id,
                     "title": title or f"vault/{vault_id}",
                     "system": system,
-                    "size_text": "",
+                    "size_text": size_text,
                     "status": "queued",
                     "progress": 0.0,
                     "message": "",
                     "speed": 0.0,
                     "eta": 0.0,
                     "resolved": False,
-                    "discs": [],
+                    "scanned": scanned,
+                    # True once the user has actually picked discs for this
+                    # game, as opposed to us merely knowing what they are.
+                    "chosen": False,
+                    "discs": discs,
                 })
                 added.append(vault_id)
         if added:
-            # Deliberately no page lookups here. Names fill in as the run
-            # reaches each game, or on demand when an item is opened.
+            # No page lookups here beyond what the cache already knows. The
+            # rest fill in as the run reaches each game.
             self.log(f"added {len(added)} item(s) to the queue")
             self.emit({"type": "queue", "queue": self.queue})
         return len(added)
@@ -251,6 +293,17 @@ class Hub:
             return
         item.update(fields)
         self.emit({"type": "item", "item": item})
+
+    def drop_item(self, vault_id: int) -> None:
+        """Take a finished game out of the queue - history has it now."""
+        with self._lock:
+            for index, item in enumerate(self.queue):
+                if item["vault_id"] == vault_id:
+                    del self.queue[index]
+                    break
+            else:
+                return
+        self.emit({"type": "queue", "queue": self.queue})
 
     # ---------------------------------------------------------- resolution
 
@@ -267,30 +320,45 @@ class Hub:
                 "size_text": media.size_text(0),
                 "selected": True,
             })
+        disc_list = [discs[d] for d in sorted(discs)]
+        title = page.title
+        system = system_folder(page.title, getattr(opts, "folders", None))
+        size_text = page.media[0].size_text(0) if page.media else ""
         self.patch_item(
             vault_id,
-            title=page.title,
-            system=system_folder(page.title, getattr(opts, "folders", None)),
-            size_text=page.media[0].size_text(0) if page.media else "",
-            discs=[discs[d] for d in sorted(discs)],
+            title=title,
+            system=system,
+            size_text=size_text,
+            discs=disc_list,
             resolved=True,
+            scanned=True,
         )
+        # Remember it, so this game never costs a page view again. Which
+        # discs are *ticked* is per-queue-item and deliberately not stored.
+        self.vault_cache[str(vault_id)] = {
+            "title": title,
+            "system": system,
+            "size_text": size_text,
+            "discs": [{"disc": d["disc"], "size_text": d["size_text"]}
+                      for d in disc_list],
+        }
+        _save_json(DATA_DIR / "vault_cache.json", self.vault_cache)
 
-    def resolve_item(self, vault_id: int) -> dict:
+    def resolve_item(self, vault_id: int, force: bool = False) -> dict:
         """Look one game up now, on request.
 
-        Nothing is fetched when a game is queued: the run fetches each page
-        anyway, and looking every pasted ID up front is what tripped the
-        site's rate limit. This runs only when someone opens an item to
-        choose discs.
+        Used when a row is opened before the run has reached it. Anything
+        already known - held page, or disc counts recovered from the cache -
+        answers without touching the network unless `force` says otherwise.
         """
         item = self.queue_item(vault_id)
         if item is None:
             return {"error": "unknown item"}
-        if item.get("resolved") or vault_id in self._pages:
+        if not force:
             if vault_id in self._pages and not item.get("resolved"):
                 self.apply_page(vault_id, self._pages[vault_id])
-            return {"item": self.queue_item(vault_id)}
+            if item.get("resolved") or item.get("scanned"):
+                return {"item": self.queue_item(vault_id)}
 
         from .engine import BusyError, VimmClient
 
@@ -323,14 +391,75 @@ class Hub:
             self.log(f"! vault/{vault_id}: {exc}")
         return {"item": self.queue_item(vault_id)}
 
+    # -------------------------------------------------------------- prompts
+
+    def ask(self, kind: str, payload: dict, default):
+        """Put a question to the user and block the run until it is answered.
+
+        Only ever reached when the user has opted into asking, so it waits
+        indefinitely rather than guessing after a timeout. Pause and Stop are
+        never trapped behind it: the wait watches `self._cancel` too, and
+        answers with the default if the run is being torn down.
+        """
+        prompt_id = uuid.uuid4().hex[:10]
+        self._prompt_answer = None
+        self._prompt_event = threading.Event()
+        self.prompt = {"id": prompt_id, "kind": kind, **payload}
+        self.emit({"type": "prompt", "prompt": self.prompt})
+        try:
+            while not self._prompt_event.wait(0.25):
+                if self._cancel.is_set():
+                    return default
+            answer = self._prompt_answer
+            return default if answer is None else answer
+        finally:
+            self.prompt = None
+            self.emit({"type": "prompt", "prompt": None})
+
+    def answer_prompt(self, prompt_id: str, answer) -> dict:
+        prompt = self.prompt
+        if prompt is None or prompt["id"] != prompt_id:
+            # Already withdrawn - the run was stopped, or this is a stale tab.
+            return {"error": "that question is no longer open"}
+        self._prompt_answer = answer
+        self._prompt_event.set()
+        return {"ok": True}
+
     # ---------------------------------------------------------------- runs
 
+    def set_discs(self, vault_id: int, wanted: set[int]) -> dict:
+        """Tick or untick the discs of a multi-disc game.
+
+        A run keeps one options object for its whole life, and `select_media`
+        reads `disc_overrides` from it at the moment it reaches each game. So
+        updating it here applies to everything the run has not started yet -
+        which is what lets a choice be made during a run, not only before it.
+        """
+        item = self.queue_item(vault_id)
+        if item is None:
+            return {"error": "unknown item"}
+        if item["status"] not in ("queued", "paused"):
+            return {"error": f"already {item['status']} - too late to change discs"}
+        for disc in item.get("discs") or []:
+            disc["selected"] = disc["disc"] in wanted
+        item["chosen"] = True
+        if self._opts is not None and len(item.get("discs") or []) > 1:
+            self._opts.disc_overrides[vault_id] = [
+                d["disc"] for d in item["discs"] if d["selected"]]
+        self.emit({"type": "item", "item": item})
+        return {"item": item}
+
     def disc_overrides(self) -> dict[int, list[int]]:
-        """Per-game disc choices from the queue's checkboxes."""
+        """Per-game disc choices the user actually made.
+
+        Only games ticked through deliberately. A game whose discs are merely
+        *known* - filled in from the cache, say - must not appear here, or it
+        would look like a settled choice and suppress the "ask me" prompt.
+        """
         overrides: dict[int, list[int]] = {}
         for item in self.queue:
             discs = item.get("discs") or []
-            if len(discs) > 1:
+            if item.get("chosen") and len(discs) > 1:
                 overrides[item["vault_id"]] = [
                     d["disc"] for d in discs if d.get("selected", True)]
         return overrides
@@ -344,6 +473,11 @@ class Hub:
             organize=bool(s["organize"]),
             prefer=s["prefer"],
             version_policy=s["version_policy"],
+            # "ask" is not a sort order - it routes to the engine's existing
+            # `pick` hook instead of a policy.
+            pick=s["version_policy"] == "ask",
+            ask_discs=s.get("disc_policy") == "ask",
+            formats=dict(s.get("formats") or {}),
             delay=float(s["delay"]),
             sweeps=int(s["sweeps"]),
             cancel_busy=bool(s["cancel_busy"]),
@@ -786,6 +920,10 @@ class WebListener(Listener):
         self._speed = 0.0      # smoothed bytes/sec
         self._last_at = 0.0
         self._last_done = 0
+        # vault_id -> how many files this game still owes, and how they went.
+        # `item_done` fires per disc, so this is what tells disc 1 of 3
+        # finishing apart from the whole game finishing.
+        self._plan: dict[int, dict] = {}
 
     def item_started(self, position, total, vault_id, sweep_label=""):
         self._current = vault_id
@@ -858,7 +996,31 @@ class WebListener(Listener):
     def progress_done(self, text):
         self.hub.log(f"  {text}")
 
+    def item_plan(self, vault_id: int, downloads: int):
+        self._plan[vault_id] = {"left": downloads, "failed": 0}
+
     def item_done(self, result: Result):
+        plan = self._plan.get(result.vault_id)
+        if plan is not None:
+            plan["left"] = max(plan["left"] - 1, 0)
+            if result.status == "failed":
+                plan["failed"] += 1
+
+        entry = self.hub.add_history(result)
+        if entry is not None and self.hub.settings["auto_extract"]:
+            self.hub.submit_stage(entry, "extract")
+
+        if plan is not None and plan["left"] > 0 and result.status == "ok":
+            # One disc of several. The game is not finished, so its row stays
+            # exactly where it is - moving it to history now would take the
+            # card away while the remaining discs are still downloading.
+            remaining = plan["left"]
+            self.hub.patch_item(
+                result.vault_id, progress=0.0, speed=0.0, eta=0.0,
+                waiting_until=0,
+                message=f"disc done, {remaining} more to go")
+            return
+
         status_map = {"ok": "done", "skipped": "skipped", "failed": "failed",
                       "listed": "listed"}
         self.hub.patch_item(result.vault_id,
@@ -866,9 +1028,50 @@ class WebListener(Listener):
                             progress=1.0 if result.status == "ok" else 0.0,
                             speed=0.0, eta=0.0, waiting_until=0,
                             message=result.message)
-        entry = self.hub.add_history(result)
-        if entry is not None and self.hub.settings["auto_extract"]:
-            self.hub.submit_stage(entry, "extract")
+        # Finished games leave the queue so whatever is downloading stays at
+        # the top; they are in the history now. Only a game that is wholly
+        # "ok" goes: `add_history` records nothing else, so dropping a skipped
+        # or failed one would erase it without trace, the retry sweeps need
+        # the failed ones, and a game whose disc 2 failed is not finished
+        # however well disc 3 went.
+        if result.status == "ok" and (plan is None or plan["failed"] == 0):
+            self.hub.drop_item(result.vault_id)
+
+    def choose_discs(self, page, discs):
+        """Only reached with "Discs - ask me" on. Blocks the run."""
+        item = self.hub.queue_item(page.vault_id) or {}
+        known = {d["disc"]: d for d in (item.get("discs") or [])}
+        self.hub.log(f"  waiting for you to choose discs for {page.title}")
+        answer = self.hub.ask("discs", {
+            "vault_id": page.vault_id,
+            "title": page.title,
+            "discs": [{"disc": d,
+                       "size_text": (known.get(d) or {}).get("size_text", ""),
+                       "selected": True} for d in discs],
+        }, default=list(discs))
+        if answer == "skip":
+            return []
+        chosen = [int(d) for d in answer]
+        self.hub.patch_item(page.vault_id, chosen=True)
+        return chosen
+
+    def choose_versions(self, page, candidates, alt_of):
+        """Only reached with "Revision - ask me" on. Blocks the run."""
+        self.hub.log(f"  waiting for you to choose a revision for {page.title}")
+        answer = self.hub.ask("versions", {
+            "vault_id": page.vault_id,
+            "title": page.title,
+            "disc": candidates[0].disc,
+            "versions": [{"media_id": m.media_id, "version": m.version,
+                          "filename": m.filename,
+                          "size_text": m.size_text(alt_of(m))}
+                         for m in candidates],
+        }, default=[candidates[0].media_id])
+        if answer == "skip":
+            return []
+        wanted = {int(m) for m in answer}
+        picked = [m for m in candidates if m.media_id in wanted]
+        return picked or candidates[:1]
 
     def sweep_started(self, sweep, pending):
         self.hub.log(f"=== sweep {sweep}: retrying {pending} unfinished ===")
@@ -918,6 +1121,7 @@ def create_app() -> FastAPI:
             "log": hub.log_lines[-200:],
             "tag_vocabulary": hub.tag_vocabulary,
             "site": hub.site.as_dict(),
+            "prompt": hub.prompt,
         }
 
     @app.post("/api/site/check")
@@ -943,24 +1147,25 @@ def create_app() -> FastAPI:
         return {"added": added, "queue": hub.queue}
 
     @app.post("/api/queue/{vault_id}/resolve")
-    def resolve_one(vault_id: int):
+    def resolve_one(vault_id: int, force: bool = False):
         """Look a single game up, when its row is opened."""
-        result = hub.resolve_item(vault_id)
+        result = hub.resolve_item(vault_id, force=force)
         if "error" in result:
             return JSONResponse(result, status_code=404)
         return result
 
     @app.post("/api/queue/{vault_id}/discs")
     def set_discs(vault_id: int, body: dict):
-        """Tick/untick which discs of a multi-disc game to download."""
-        item = hub.queue_item(vault_id)
-        if item is None:
-            return JSONResponse({"error": "unknown item"}, status_code=404)
-        wanted = {int(d) for d in body.get("discs", [])}
-        for disc in item.get("discs", []):
-            disc["selected"] = disc["disc"] in wanted
-        hub.emit({"type": "item", "item": item})
-        return {"item": item}
+        """Tick/untick which discs of a multi-disc game to download.
+
+        Accepted right up until the run starts that game, so the choice can
+        be made while earlier games download.
+        """
+        result = hub.set_discs(vault_id, {int(d) for d in body.get("discs", [])})
+        if "error" in result:
+            code = 404 if result["error"] == "unknown item" else 409
+            return JSONResponse(result, status_code=code)
+        return result
 
     @app.delete("/api/queue/{vault_id}")
     def remove_queue(vault_id: int):
@@ -987,6 +1192,17 @@ def create_app() -> FastAPI:
         return {"queue": hub.queue}
 
     # --------------------------------------------------------------- run
+
+    @app.post("/api/prompt/{prompt_id}")
+    def answer_prompt(prompt_id: str, body: dict):
+        """Answer whatever the run is currently waiting on.
+
+        `answer` is a list of disc numbers or media ids, or the string "skip".
+        """
+        result = hub.answer_prompt(prompt_id, body.get("answer"))
+        if "error" in result:
+            return JSONResponse(result, status_code=409)
+        return result
 
     @app.post("/api/run/start")
     def start():
