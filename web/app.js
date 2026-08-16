@@ -43,6 +43,11 @@ function connectWS() {
   ws.onmessage = (message) => {
     const event = JSON.parse(message.data);
     switch (event.type) {
+      case "state":
+        // Sent the moment the socket connects, so anything emitted before
+        // we were listening is recovered rather than lost.
+        applySnapshot(event.state);
+        break;
       case "log":
         state.log.push(event.text);
         state.log = state.log.slice(-500);
@@ -755,8 +760,7 @@ $("log-toggle").onclick = () => $("log").classList.toggle("hidden");
 
 /* ------------------------------------------------------------------ boot */
 
-(async function boot() {
-  const snapshot = await api("GET", "/api/state");
+function applySnapshot(snapshot) {
   Object.assign(state, snapshot);
   state.jobs = Object.fromEntries((snapshot.jobs || []).map(j => [j.id, j]));
   renderActive();
@@ -764,5 +768,12 @@ $("log-toggle").onclick = () => $("log").classList.toggle("hidden");
   renderSite();
   renderLog();
   renderPrompt();
+}
+
+(async function boot() {
+  // Painted from the fetch so the interface appears at once; the socket
+  // sends its own snapshot on connect, which corrects anything that changed
+  // in between - the startup site check usually lands in exactly that gap.
+  applySnapshot(await api("GET", "/api/state"));
   connectWS();
 })();

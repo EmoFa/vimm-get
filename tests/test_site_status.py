@@ -28,6 +28,35 @@ def check(name, ok, detail=""):
         failures.append(name)
 
 
+def wait_for(predicate, timeout=20, poll=0.05):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(poll)
+    return False
+
+
+def first_message(ws, timeout=10):
+    """The socket's first message, or None if it never speaks.
+
+    Read on a side thread: a plain receive blocks for ever when nothing is
+    sent, and a regression here should fail the suite rather than hang it.
+    """
+    box = {}
+
+    def read():
+        try:
+            box["text"] = ws.receive_text()
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    return json.loads(box["text"]) if "text" in box else None
+
+
 MODE = {"kind": "ok"}
 
 HEALTHY = b"<html><body><h1>Vimm's Lair</h1><p>Welcome to the Vault.</p></body></html>"
@@ -169,6 +198,73 @@ with client:
     check("state endpoint stays responsive during a hanging check",
           r.status_code == 200 and elapsed < 2, f"{elapsed:.2f}s")
     check("indicator shows 'checking' meanwhile", hub.site.state == "checking")
+
+# ============ the reported bug: the answer arrives before anyone is listening
+print("=== a client connecting late is still told the result ===")
+# The startup check finishes about a second in, often between the page
+# fetching /api/state and its socket connecting. Events go only to whoever is
+# listening at the time, so that answer used to be thrown away and the
+# indicator sat on "checking..." until clicked. Forced here rather than raced:
+# the check is allowed to finish with nothing connected at all.
+MODE["kind"] = "ok"
+app2 = srv.create_app()
+hub2 = app2.state.hub
+hub2.site_base_override = SITE
+client2 = TestClient(app2)
+
+with client2:
+    hub2.check_site()
+    check("the check settles with no client attached",
+          wait_for(lambda: hub2.site.state != "checking", 20), hub2.site.state)
+
+    # Only now does a browser turn up.
+    with client2.websocket_connect("/ws") as ws:
+        first = first_message(ws) or {}
+        check("the socket is greeted with a state snapshot",
+              first.get("type") == "state",
+              "nothing was sent at all" if not first else str(first.get("type")))
+        site = first.get("state", {}).get("site", {})
+        check("carrying a settled site state, not 'checking'",
+              site.get("state") in ("up", "down", "maintenance"),
+              str(site))
+        check("and a reason to show", bool(site.get("detail")), str(site))
+
+print("=== the snapshot carries the rest of the picture too ===")
+with client2:
+    hub2.run_status = "running"
+    hub2.prompt = {"id": "abc", "kind": "discs", "title": "Something"}
+    with client2.websocket_connect("/ws") as ws:
+        snap = (first_message(ws) or {}).get("state", {})
+        check("run status is included", snap.get("run") == "running",
+              str(snap.get("run")))
+        check("an outstanding question is included",
+              (snap.get("prompt") or {}).get("id") == "abc",
+              str(snap.get("prompt")))
+    hub2.prompt = None
+    hub2.run_status = "idle"
+
+print("=== both routes serve the same thing ===")
+with client2:
+    over_http = set(client2.get("/api/state").json())
+    with client2.websocket_connect("/ws") as ws:
+        over_ws = set((first_message(ws) or {}).get("state", {}))
+    check("/api/state and the socket snapshot agree on their keys",
+          over_http == over_ws, str(over_http ^ over_ws))
+
+print("=== a check that blows up still settles ===")
+app3 = srv.create_app()
+hub3 = app3.state.hub
+_real_check = srv.check_site
+srv.check_site = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    with TestClient(app3):
+        hub3.check_site()
+        check("it ends up down rather than stuck on checking",
+              wait_for(lambda: hub3.site.state == "down", 20), hub3.site.state)
+        check("and says what went wrong", "boom" in hub3.site.detail,
+              hub3.site.detail)
+finally:
+    srv.check_site = _real_check
 
 server.shutdown()
 print()
