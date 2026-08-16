@@ -33,7 +33,19 @@ TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 _7Z_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _GITHUB_LATEST = "https://api.github.com/repos/mamedev/mame/releases/latest"
 
-_PCT = re.compile(r"(\d+(?:\.\d+)?)%")
+# chdman puts two percentages on a progress line and one on its closing
+# summary:
+#     Compressing, 75.0% complete... (ratio=0.4%)
+#     Compression complete ... final ratio = 0.3%
+# Matching any percentage picked up the ratio, so the bar leapt backwards to
+# it the moment compression finished. Only "N% complete" is progress.
+_PCT = re.compile(r"(\d+(?:\.\d+)?)%\s*complete")
+
+
+def progress_percent(line: str) -> float | None:
+    """The completion percentage chdman is reporting, if this line has one."""
+    match = _PCT.search(line)
+    return float(match.group(1)) if match else None
 
 
 def find_chdman() -> Path | None:
@@ -143,7 +155,16 @@ def chdman_subcommand(image: Path) -> str:
 
 
 def sources_of(sheet: Path) -> list[Path]:
-    """The image files a .cue or .gdi sheet references (bin tracks etc.)."""
+    """The image files a .cue or .gdi sheet references (bin tracks etc.).
+
+    An .iso has no sheet to parse and must be rejected *before* the read.
+    Sheets are a few hundred bytes, but a PS2 .iso is gigabytes, and
+    decoding one as UTF-8 to discover it lists nothing took 11 seconds for
+    1.5 GB - stalling every other thread for 5 of them, because the decode
+    holds the GIL. That was the freeze at the end of a conversion.
+    """
+    if sheet.suffix.lower() not in (".cue", ".gdi"):
+        return []
     text = sheet.read_text(encoding="utf-8", errors="replace")
     names: list[str] = []
     if sheet.suffix.lower() == ".cue":
@@ -198,6 +219,7 @@ def compress_to_chd(sheet: Path, delete_sources: bool = True,
     )
     tail: list[str] = []
     line = ""
+    highest = 0.0
     assert process.stdout is not None
     while True:
         ch = process.stdout.read(1)
@@ -207,9 +229,13 @@ def compress_to_chd(sheet: Path, delete_sources: bool = True,
             if line.strip():
                 tail.append(line.strip())
                 tail[:] = tail[-5:]
-                match = _PCT.search(line)
-                if match and progress:
-                    progress(float(match.group(1)), 100.0)
+                percent = progress_percent(line)
+                # Never let the bar run backwards. Parsing the ratio was the
+                # known cause and is fixed above; this makes the symptom
+                # impossible even if chdman's wording changes again.
+                if percent is not None and progress and percent >= highest:
+                    highest = percent
+                    progress(percent, 100.0)
             line = ""
         else:
             line += ch

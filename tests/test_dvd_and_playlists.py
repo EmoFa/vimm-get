@@ -67,6 +67,61 @@ check("an .rvz is not compressed - Dolphin cannot read CHD",
 check("an image that already has a .chd is skipped",
       "Already (USA).iso" not in found, str(found))
 
+# ================================ a disc image must never be read as text
+print("=== sources_of never opens an image it has no sheet to parse ===")
+# It used to read the whole file before checking the suffix. Harmless for a
+# few hundred bytes of cue, ruinous for a PS2 iso: 11s for 1.5 GB, stalling
+# every other thread for 5 of them, to return []. Asserted by making any
+# read explode, rather than by timing, which would be flaky.
+_real_read_text = Path.read_text
+
+
+def _explode(self, *a, **k):
+    raise AssertionError(f"read the whole of {self.name}")
+
+
+Path.read_text = _explode
+try:
+    check("an .iso is answered without reading it",
+          chd_mod.sources_of(iso) == [], "it read the file")
+    check("so is an .rvz", chd_mod.sources_of(rvz) == [])
+except AssertionError as exc:
+    check("an .iso is answered without reading it", False, str(exc))
+finally:
+    Path.read_text = _real_read_text
+
+print("=== but sheets are still parsed ===")
+d_sheets = tempdir()
+(d_sheets / "Game (Track 1).bin").write_bytes(b"x" * 100)
+(d_sheets / "Game (Track 2).bin").write_bytes(b"x" * 100)
+cue2 = d_sheets / "Game.cue"
+cue2.write_text('FILE "Game (Track 1).bin" BINARY\n  TRACK 01 MODE2/2352\n'
+                'FILE "Game (Track 2).bin" BINARY\n  TRACK 02 AUDIO\n')
+check("a cue still lists its tracks",
+      sorted(p.name for p in chd_mod.sources_of(cue2))
+      == ["Game (Track 1).bin", "Game (Track 2).bin"],
+      str([p.name for p in chd_mod.sources_of(cue2)]))
+
+(d_sheets / "Disc (Track 1).bin").write_bytes(b"y" * 100)
+gdi = d_sheets / "Disc.gdi"
+gdi.write_text('1\n1 0 4 2352 "Disc (Track 1).bin" 0\n')
+check("a gdi still lists its tracks",
+      [p.name for p in chd_mod.sources_of(gdi)] == ["Disc (Track 1).bin"],
+      str([p.name for p in chd_mod.sources_of(gdi)]))
+
+# ==================================== progress must not run backwards
+print("=== only chdman's completion figure counts as progress ===")
+# The exact lines chdman emits, captured from a real run.
+check("a progress line reports its completion, not its ratio",
+      chd_mod.progress_percent("Compressing, 75.0% complete... (ratio=0.4%)") == 75.0)
+check("zero percent is still reported",
+      chd_mod.progress_percent("Compressing, 0.0% complete... (ratio=100.0%)") == 0.0)
+check("the closing summary is not progress at all",
+      chd_mod.progress_percent("Compression complete ... final ratio = 0.3%") is None,
+      str(chd_mod.progress_percent("Compression complete ... final ratio = 0.3%")))
+check("nor is a line with no percentage",
+      chd_mod.progress_percent("Input file:   C:\\games\\thing.iso") is None)
+
 print("=== compress_to_chd refuses what it cannot handle ===")
 try:
     chd_mod.compress_to_chd(rvz)
@@ -81,12 +136,24 @@ else:
     print("=== chdman really converts a PS2-style ISO ===")
     d2 = tempdir()
     real_iso = d2 / "PS2 Game (USA).iso"
-    # A DVD image is a whole number of 2048-byte sectors.
-    real_iso.write_bytes(os.urandom(2048 * 512))
+    # A DVD image is a whole number of 2048-byte sectors. It has to be big
+    # enough that chdman reports progress several times before finishing,
+    # or the closing "final ratio" would be the *only* other number and a
+    # backwards jump could not show up as one.
+    chunk = os.urandom(2048 * 512)
+    real_iso.write_bytes(b"".join(chunk if i % 4 == 0 else bytes(2048 * 512)
+                                  for i in range(200)))          # ~200 MB
+    reported = []
     try:
-        out = chd_mod.compress_to_chd(real_iso, delete_sources=True)
+        out = chd_mod.compress_to_chd(
+            real_iso, delete_sources=True,
+            progress=lambda done, total: reported.append(done))
         check("a .chd came out", out.is_file() and out.suffix == ".chd", str(out))
         check("and the iso was replaced", not real_iso.exists())
+        check("progress was reported", len(reported) > 1, str(reported))
+        check("it never ran backwards",
+              reported == sorted(reported), str(reported))
+        check("and it finished at 100", reported[-1] == 100.0, str(reported[-1]))
     except VimmError as exc:
         check("chdman converted the iso", False, str(exc))
 
