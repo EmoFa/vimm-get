@@ -229,6 +229,10 @@ button:disabled { opacity: .35; cursor: default; filter: none; }
   border-radius: 7px; padding: 4px 10px; cursor: pointer;
 }
 .disc-chip.on { color: var(--amber); border-color: var(--amber-deep); }
+/* Settled: on disk, or the run is mid-way through this game. Dimmed so the
+   difference is visible rather than only discoverable by clicking. */
+.disc-chip.locked { opacity: .55; cursor: not-allowed; }
+.disc-chip.locked input { cursor: not-allowed; }
 .disc-chip input { accent-color: var(--amber); cursor: pointer; }
 .disc-label { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
 

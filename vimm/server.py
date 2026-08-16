@@ -505,6 +505,22 @@ class Hub:
             return {"error": "unknown item"}
         if item["status"] not in ("queued", "paused"):
             return {"error": f"already {item['status']} - too late to change discs"}
+
+        # Unticking a disc that is already on disk, whole or partly, would
+        # read as "undo that download" and do nothing of the sort. Ticking is
+        # always allowed - including a disc the run has gone past, which Start
+        # picks up on its next pass.
+        self.refresh_disc_states(vault_id)
+        for disc in item.get("discs") or []:
+            if disc["disc"] in wanted or not disc.get("selected", True):
+                continue
+            if disc.get("done"):
+                return {"error": f"disc {disc['disc']} has already been "
+                                 f"downloaded"}
+            if disc.get("active"):
+                return {"error": f"disc {disc['disc']} is part-downloaded - "
+                                 f"it resumes on Start"}
+
         for disc in item.get("discs") or []:
             disc["selected"] = disc["disc"] in wanted
         item["chosen"] = True
@@ -597,6 +613,51 @@ class Hub:
                 if part is not None and part not in found:
                     found.append(part)
         return found
+
+    def refresh_disc_states(self, vault_id: int | None = None) -> None:
+        """Mark each disc as already downloaded, part-downloaded, or neither.
+
+        "Done" comes from history as well as from disk: `find_download`
+        only recognises an archive, and extraction deletes that, so a
+        finished disc would otherwise stop reading as done the moment it was
+        unpacked - and quietly become unlockable again. History records every
+        successful download with its disc number and outlives the archive.
+
+        Only called when the answer can change - a disc finishing, a run
+        ending - never on the progress tick, which fires far too often to be
+        listing directories.
+        """
+        opts = self._opts or self.build_options()
+        changed: dict[int, dict] = {}
+        for item in self.queue:
+            if vault_id is not None and item["vault_id"] != vault_id:
+                continue
+            discs = item.get("discs") or []
+            page = self._pages.get(item["vault_id"])
+            if not discs or page is None:
+                continue
+            entry = next((h for h in self.history
+                          if h["vault_id"] == item["vault_id"]), None)
+            done: set[int] = {f.get("disc") for f in (entry or {}).get("files", [])}
+            active: set[int] = set()
+            dest = Path(destination_for(page, opts))
+            for media in page.media:
+                stem = safe_filename(Path(media.filename).stem,
+                                     f"media-{media.media_id}")
+                if find_download(dest, stem, partial=False) is not None:
+                    done.add(media.disc)
+                elif find_download(dest, stem, partial=True) is not None:
+                    active.add(media.disc)
+            for disc in discs:
+                was = (disc.get("done"), disc.get("active"))
+                disc["done"] = disc["disc"] in done
+                # A disc that finished is no longer "in progress", however
+                # many partial files an earlier attempt left lying about.
+                disc["active"] = disc["disc"] in active and not disc["done"]
+                if was != (disc["done"], disc["active"]):
+                    changed[item["vault_id"]] = item
+        for item in changed.values():
+            self.emit({"type": "item", "item": item})
 
     def partials_summary(self) -> dict:
         parts = self.item_partials()
@@ -709,6 +770,9 @@ class Hub:
             self.run_status = f"error: {exc}"
             self.log(f"! unexpected: {exc}")
         finally:
+            # However the run ended, the picker needs to know which discs are
+            # now on disk before anyone can edit them again.
+            self.refresh_disc_states()
             self.emit({"type": "run", "status": self.run_status})
 
     # -------------------------------------------------------------- history
@@ -1224,6 +1288,10 @@ class WebListener(Listener):
         # whole game.
         if entry is not None and self.hub.settings["auto_extract"]:
             self.hub.submit_stage(entry, "extract")
+
+        # A disc that just landed can no longer be unticked, and extraction
+        # may have taken its archive away, so re-read what is on disk.
+        self.hub.refresh_disc_states(result.vault_id)
 
         if plan is not None and plan["left"] > 0 and result.status == "ok":
             # One disc of several. The game is not finished, so its row stays
