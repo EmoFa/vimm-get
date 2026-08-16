@@ -621,13 +621,35 @@ class Hub:
         self.emit({"type": "queue", "queue": self.queue})
         return removed
 
+    def _pending_ids(self, attempted: set[int]) -> list[int]:
+        """Queued games this run has not taken a turn at yet."""
+        return [q["vault_id"] for q in self.queue
+                if q["status"] == "queued" and q["vault_id"] not in attempted]
+
     def _run(self, ids: list[int]) -> None:
         listener = WebListener(self)
+        results = []
         try:
-            # Share the page cache: anything already looked up for the disc
-            # picker is reused, and pages fetched here serve later sweeps.
-            results = run_http(ids, self._opts, listener=listener,
-                               cancel_event=self._cancel, pages=self._pages)
+            # Adding to a queue that is already running should just work, so
+            # the batch is re-read from the queue rather than frozen at Start.
+            # Every id a pass touches leaves "queued" - item_done moves it on,
+            # and a finished game is dropped from the queue outright - so this
+            # ends on its own; `attempted` makes that a property of the code
+            # instead of a chain of reasoning somewhere else.
+            attempted: set[int] = set()
+            batch = list(ids)
+            while batch:
+                attempted.update(batch)
+                # Share the page cache: anything already looked up for the
+                # disc picker is reused, and pages fetched here serve later
+                # sweeps.
+                results += run_http(batch, self._opts, listener=listener,
+                                    cancel_event=self._cancel, pages=self._pages)
+                batch = self._pending_ids(attempted)
+                if batch:
+                    self.log(f"{len(batch)} more added since starting - "
+                             f"carrying on")
+
             done = sum(1 for r in results if r.status == "ok")
             failed = sum(1 for r in results if r.status == "failed")
             self.run_status = (f"finished - {done} downloaded"

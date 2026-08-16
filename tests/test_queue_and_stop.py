@@ -275,6 +275,70 @@ with client5:
     time.sleep(0.4)
     check("the finished file survives Stop", (out5 / "Game 960 (USA).zip").is_file())
 
+# ==================================== adding to a queue that is already running
+print("=== a game added mid-run is picked up without pressing Start again ===")
+MODE["drip"] = True
+out6 = Path(tempfile.mkdtemp(prefix="vimmqs_late_"))
+app6, hub6 = make_app(out6)
+client6 = TestClient(app6)
+with client6:
+    client6.post("/api/queue", json={"text": "970"})
+    check("started", client6.post("/api/run/start").json()["status"] == "started")
+    check("the first game is downloading",
+          wait_for(lambda: any(q["status"] == "downloading" for q in hub6.queue), 30))
+
+    # Add while the run is in flight. Start is deliberately not pressed again.
+    client6.post("/api/queue", json={"text": "971"})
+    MODE["drip"] = False
+
+    check("run finished", wait_for(lambda: hub6.run_status.startswith("finished"), 120),
+          hub6.run_status)
+    check("both games downloaded, on one Start",
+          "2 downloaded" in hub6.run_status, hub6.run_status)
+    check("the first file is there", (out6 / "Game 970 (USA).zip").is_file())
+    check("and so is the late arrival", (out6 / "Game 971 (USA).zip").is_file())
+    check("the queue is empty", hub6.queue == [], str(hub6.queue))
+
+print("=== the loop cannot take the same game twice ===")
+# What bounds the loop: a game already attempted is never offered again, and
+# only "queued" items are, so an id that ends up failed or paused does not
+# keep coming back round.
+out7 = Path(tempfile.mkdtemp(prefix="vimmqs_bound_"))
+app7, hub7 = make_app(out7)
+hub7.queue = [
+    {"vault_id": 1, "status": "queued"},
+    {"vault_id": 2, "status": "queued"},
+    {"vault_id": 3, "status": "failed"},
+    {"vault_id": 4, "status": "paused"},
+    {"vault_id": 5, "status": "downloading"},
+]
+check("fresh queued games are offered",
+      hub7._pending_ids(set()) == [1, 2], str(hub7._pending_ids(set())))
+check("one already attempted is not offered again",
+      hub7._pending_ids({1}) == [2], str(hub7._pending_ids({1})))
+check("nothing is left once both have had a turn",
+      hub7._pending_ids({1, 2}) == [], str(hub7._pending_ids({1, 2})))
+check("failed, paused and in-flight games are never picked up",
+      hub7._pending_ids(set()) == [1, 2])
+
+print("=== Stop still ends the run between batches ===")
+MODE["drip"] = True
+out8 = Path(tempfile.mkdtemp(prefix="vimmqs_latestop_"))
+app8, hub8 = make_app(out8)
+client8 = TestClient(app8)
+with client8:
+    client8.post("/api/queue", json={"text": "990"})
+    client8.post("/api/run/start")
+    wait_for(lambda: any(q["status"] == "downloading" for q in hub8.queue), 30)
+    client8.post("/api/queue", json={"text": "991"})     # queued behind it
+    client8.post("/api/run/stop")
+    check("the run stops promptly", wait_for(
+        lambda: not hub8.run_status.endswith("ing"), 30), hub8.run_status)
+    check("it says it discarded", "discard" in hub8.run_status, hub8.run_status)
+    check("the late arrival was never started",
+          not (out8 / "Game 991 (USA).zip").is_file())
+MODE["drip"] = False
+
 server.shutdown()
 print()
 print("FAILURES:", failures if failures else "none")
