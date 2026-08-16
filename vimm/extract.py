@@ -6,10 +6,20 @@ disc systems). Extraction lands next to the archive; on success the archive
 is deleted along with any .txt files that came out of it (the site includes
 an info text in some archives). On failure the archive is left untouched so
 the operation can be retried.
+
+The decompression itself runs in a **child process**. py7zr is Python, so
+doing it here would hold the GIL against the download loop, which reads the
+socket 64 KB at a time and needs the lock for every chunk. Measured over
+loopback with an extraction running alongside, that cost the download half
+its throughput (2814 -> 1381 MB/s) and pushed its worst chunk gaps from
+0.1 ms to 2.2 ms - a visible stutter. The same extraction in another process
+cost 5%. chdman never had the problem because it was always a subprocess.
 """
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import threading
 import zipfile
 from pathlib import Path
@@ -45,12 +55,17 @@ def extract_archive(archive: Path, progress=None,
         raise VimmError(f"archive not found: {archive}")
     dest = archive.parent
 
-    if archive.suffix.lower() == ".zip":
-        extracted = _extract_zip(archive, dest, progress)
-    elif archive.suffix.lower() == ".7z":
-        extracted = _extract_7z(archive, dest, progress, poll_interval)
-    else:
+    suffix = archive.suffix.lower()
+    if suffix not in ARCHIVE_SUFFIXES:
         raise VimmError(f"not an archive I can extract: {archive.name}")
+
+    # Reading the index is a header parse, cheap for both formats, and it is
+    # what lets the traversal check happen before anything is written and the
+    # progress watcher know what to look for.
+    names, total = _read_index(archive)
+    targets = [_safe_member_path(dest, name) for name in names]
+
+    extracted = _extract(archive, dest, targets, total, progress, poll_interval)
 
     kept: list[Path] = []
     for path in extracted:
@@ -128,64 +143,96 @@ def _safe_member_path(dest: Path, name: str) -> Path:
     return target
 
 
-def _extract_zip(archive: Path, dest: Path, progress) -> list[Path]:
-    written: list[Path] = []
+def _read_index(archive: Path) -> tuple[list[str], int]:
+    """Member names and total uncompressed size, from the archive header."""
     try:
-        with zipfile.ZipFile(archive) as zf:
-            entries = [i for i in zf.infolist() if not i.is_dir()]
-            total = sum(i.file_size for i in entries) or 1
-            done = 0
-            for info in entries:
-                target = _safe_member_path(dest, info.filename)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info) as src, open(target, "wb") as out:
-                    while True:
-                        chunk = src.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        done += len(chunk)
-                        if progress:
-                            progress(min(done, total), total)
-                written.append(target)
-        return written
-    except (zipfile.BadZipFile, OSError) as exc:
-        _cleanup_partial(written)
-        raise VimmError(f"extraction failed: {exc}") from exc
-
-
-def _extract_7z(archive: Path, dest: Path, progress,
-                poll_interval: float = 0.3) -> list[Path]:
-    if py7zr is None:
-        raise VimmError("7z support needs py7zr:  py -m pip install py7zr")
-    written: list[Path] = []
-    try:
+        if archive.suffix.lower() == ".zip":
+            with zipfile.ZipFile(archive) as zf:
+                entries = [i for i in zf.infolist() if not i.is_dir()]
+                return ([i.filename for i in entries],
+                        sum(i.file_size for i in entries) or 1)
+        if py7zr is None:
+            raise VimmError("7z support needs py7zr:  py -m pip install py7zr")
         with py7zr.SevenZipFile(archive) as zf:
             entries = [e for e in zf.list() if not e.is_directory]
-            names = [e.filename for e in entries]
-            total = sum(e.uncompressed for e in entries) or 1
-            for name in names:
-                _safe_member_path(dest, name)  # traversal check up front
-
-            # extractall() is one long blocking call. py7zr's own callback
-            # only fires once per archive member (measured), so a single
-            # multi-gigabyte disc image - the common case here - would report
-            # nothing at all until it finished. Watching the output files
-            # grow gives real progress whatever the archive's shape.
-            targets = [dest / name for name in names]
-            with _SizeWatcher(progress, targets, total, poll_interval):
-                zf.extractall(path=dest)
-
-            for name in names:
-                target = dest / name
-                if target.is_file():
-                    written.append(target)
-        if progress:
-            progress(total, total)
-        return written
-    except (py7zr.exceptions.ArchiveError, OSError) as exc:
-        _cleanup_partial(written)
+            return ([e.filename for e in entries],
+                    sum(e.uncompressed for e in entries) or 1)
+    except VimmError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any unreadable archive reads alike
         raise VimmError(f"extraction failed: {exc}") from exc
+
+
+# Deliberately imports nothing of this package, so it does not care how the
+# app is installed or launched - only that `sys.executable` can run Python.
+_CHILD = """
+import sys, zipfile
+archive, dest = sys.argv[1], sys.argv[2]
+if archive.lower().endswith(".zip"):
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(dest)
+else:
+    import py7zr
+    with py7zr.SevenZipFile(archive) as zf:
+        zf.extractall(path=dest)
+"""
+
+
+def _spawn_extract(archive: Path, dest: Path) -> subprocess.CompletedProcess:
+    """Run the decompression in a child process. Separated for testing."""
+    return subprocess.run(
+        [sys.executable, "-c", _CHILD, str(archive), str(dest)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+
+
+def _extract(archive: Path, dest: Path, targets: list[Path], total: int,
+             progress, poll_interval: float) -> list[Path]:
+    """Unpack `archive` into `dest`, out of process, and report progress.
+
+    The watcher polls the output files rather than relying on the archive
+    library's callbacks - py7zr reports once per member, so one big disc
+    image would report nothing until it finished. Polling the filesystem also
+    happens to work perfectly well across a process boundary, which is what
+    makes running the decompression elsewhere essentially free.
+    """
+    try:
+        with _SizeWatcher(progress, targets, total, poll_interval):
+            try:
+                result = _spawn_extract(archive, dest)
+            except OSError:
+                # No usable interpreter to re-invoke. Falling back keeps the
+                # app working; the download just stutters as it used to.
+                _extract_here(archive, dest)
+            else:
+                if result.returncode != 0:
+                    detail = (result.stderr or "").strip().splitlines()
+                    raise VimmError("extraction failed: "
+                                    + (detail[-1] if detail else
+                                       f"exit code {result.returncode}"))
+    except VimmError:
+        _cleanup_partial(targets)
+        raise
+    except OSError as exc:
+        _cleanup_partial(targets)
+        raise VimmError(f"extraction failed: {exc}") from exc
+
+    written = [path for path in targets if path.is_file()]
+    if progress:
+        progress(total, total)
+    return written
+
+
+def _extract_here(archive: Path, dest: Path) -> None:
+    """The same work in this process. Only used when spawning is impossible."""
+    if archive.suffix.lower() == ".zip":
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(dest)
+        return
+    if py7zr is None:
+        raise VimmError("7z support needs py7zr:  py -m pip install py7zr")
+    with py7zr.SevenZipFile(archive) as zf:
+        zf.extractall(path=dest)
 
 
 class _SizeWatcher:
