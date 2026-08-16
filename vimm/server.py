@@ -232,6 +232,28 @@ class Hub:
         except Exception:
             self._sockets.discard(socket)
 
+    def snapshot(self) -> dict:
+        """Everything a client needs to draw the whole interface.
+
+        Served by `/api/state` and pushed to a WebSocket the moment it
+        connects, so both routes cannot drift apart.
+        """
+        return {
+            "queue": self.queue,
+            "history": [self.decorate(h) for h in self.history],
+            "jobs": self.pipeline.snapshot(),
+            "settings": self.settings,
+            "run": self.run_status,
+            "log": self.log_lines[-200:],
+            "tag_vocabulary": self.tag_vocabulary,
+            # Folder names stay defined in one place; the settings drawer
+            # renders its checkboxes from these rather than repeating them.
+            "system_options": {"chd": CHD_SYSTEM_OPTIONS,
+                               "m3u": M3U_SYSTEM_OPTIONS},
+            "site": self.site.as_dict(),
+            "prompt": self.prompt,
+        }
+
     # -------------------------------------------------------- site status
 
     def check_site(self) -> None:
@@ -244,7 +266,15 @@ class Hub:
         self.emit({"type": "site", "site": self.site.as_dict()})
 
         def run() -> None:
-            result = check_site(base=self.site_base_override)
+            try:
+                result = check_site(base=self.site_base_override)
+            except Exception as exc:  # noqa: BLE001 - must always settle
+                # `check_site` handles the request failures it expects, but
+                # anything it does not would kill this thread and strand the
+                # indicator on "checking..." for good. That word should only
+                # ever mean a check is actually in flight.
+                result = SiteStatus("down", f"check failed: {exc}"[:120],
+                                    time.time())
             self.site = result
             self.emit({"type": "site", "site": result.as_dict()})
             if result.state != "up":
@@ -1297,21 +1327,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/state")
     def state():
-        return {
-            "queue": hub.queue,
-            "history": [hub.decorate(h) for h in hub.history],
-            "jobs": hub.pipeline.snapshot(),
-            "settings": hub.settings,
-            "run": hub.run_status,
-            "log": hub.log_lines[-200:],
-            "tag_vocabulary": hub.tag_vocabulary,
-            # Folder names stay defined in one place; the settings drawer
-            # renders its checkboxes from these rather than repeating them.
-            "system_options": {"chd": CHD_SYSTEM_OPTIONS,
-                               "m3u": M3U_SYSTEM_OPTIONS},
-            "site": hub.site.as_dict(),
-            "prompt": hub.prompt,
-        }
+        return hub.snapshot()
 
     @app.post("/api/site/check")
     def recheck_site():
@@ -1480,6 +1496,18 @@ def create_app() -> FastAPI:
     async def websocket(socket: WebSocket):
         await socket.accept()
         hub._sockets.add(socket)
+        # Catch the client up before anything else. Events are fire-and-forget
+        # to whoever is listening at the time, so anything that happened
+        # before this socket existed was dropped - the startup site check
+        # being the one that bit: it finishes about a second in, often in the
+        # gap between the page fetching /api/state and getting here, leaving
+        # the indicator on "checking..." with the answer already thrown away.
+        try:
+            await socket.send_text(json.dumps({"type": "state",
+                                               "state": hub.snapshot()}))
+        except Exception:  # noqa: BLE001 - a client that vanished is not news
+            hub._sockets.discard(socket)
+            return
         try:
             while True:
                 await socket.receive_text()  # keep-alive; content ignored
