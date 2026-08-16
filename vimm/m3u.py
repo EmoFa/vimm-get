@@ -23,13 +23,16 @@ from pathlib import Path
 from .engine import VimmError
 
 # Folder names (SYSTEM_FOLDERS values) whose common emulators read m3u.
-# Editable in the web app's settings.
-DEFAULT_M3U_SYSTEMS = ["psx", "saturn", "segacd", "tgcd", "dreamcast", "cdimono1"]
+# Editable in the web app's settings, which offers exactly these.
+DEFAULT_M3U_SYSTEMS = ["psx", "saturn", "segacd", "tgcd", "dreamcast",
+                       "cdimono1", "gc"]
 
 # Disc image types worth listing in a playlist, in preference order: a .chd
-# stands alone; .cue/.gdi reference their .bin tracks (which must move with
-# them but never appear in the m3u).
-_PLAYLIST_TYPES = (".chd", ".cue", ".gdi")
+# stands alone and supersedes whatever it was made from; .cue/.gdi reference
+# their .bin tracks (which must move with them but never appear in the m3u);
+# the rest are the single-file images the DVD systems arrive as, GameCube's
+# three formats among them (.nkit.iso has suffix .iso).
+_PLAYLIST_TYPES = (".chd", ".cue", ".gdi", ".rvz", ".iso", ".ciso")
 _COMPANION_TYPES = (".bin", ".raw", ".iso", ".img", ".sub", ".wav")
 
 _DISC_TAG = re.compile(r"\s*\((?:Disc|Disk|CD)\s*(\d+)\)", re.I)

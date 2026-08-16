@@ -48,10 +48,28 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 WEB_DIR = ROOT / "web"
 
-# Systems where a game arrives as split disc images (bin+cue, gdi) that CHD
-# usefully collapses into one file. Deliberately excludes ps2/psp (single
-# ISOs - nothing to collapse) and both Jaguars (BigPEmu cannot read CHD).
-DEFAULT_CHD_SYSTEMS = ["psx", "saturn", "segacd", "tgcd", "dreamcast", "cdimono1"]
+# Systems worth converting to CHD, and the systems offered in the settings.
+# Two reasons a system belongs: its games arrive as split disc images that CHD
+# collapses into one file (the bin+cue and gdi systems), or its images are
+# simply large and its emulator reads CHD - which is the case for PS2, where
+# PCSX2 opens .chd directly. Both Jaguars stay out because BigPEmu cannot read
+# CHD, and GameCube stays out because Dolphin cannot either; .rvz is the
+# equivalent there and is offered under FORMATS instead.
+CHD_SYSTEM_OPTIONS = [
+    ("psx", "PS1"), ("saturn", "Saturn"), ("segacd", "Sega CD"),
+    ("tgcd", "TurboGrafx-CD"), ("dreamcast", "Dreamcast"),
+    ("cdimono1", "Philips CD-i"), ("ps2", "PS2"),
+]
+DEFAULT_CHD_SYSTEMS = [folder for folder, _ in CHD_SYSTEM_OPTIONS]
+
+# Systems whose emulators read .m3u for disc swapping. GameCube is here but
+# not in the CHD list above: Dolphin handles multi-disc games through a
+# playlist perfectly well, it just will not open a .chd.
+M3U_SYSTEM_OPTIONS = [
+    ("psx", "PS1"), ("saturn", "Saturn"), ("segacd", "Sega CD"),
+    ("tgcd", "TurboGrafx-CD"), ("dreamcast", "Dreamcast"),
+    ("cdimono1", "Philips CD-i"), ("gc", "GameCube"),
+]
 
 DEFAULT_SETTINGS = {
     "out": str(Path.home() / "Downloads" / "Vimm"),
@@ -1257,6 +1275,10 @@ def create_app() -> FastAPI:
             "run": hub.run_status,
             "log": hub.log_lines[-200:],
             "tag_vocabulary": hub.tag_vocabulary,
+            # Folder names stay defined in one place; the settings drawer
+            # renders its checkboxes from these rather than repeating them.
+            "system_options": {"chd": CHD_SYSTEM_OPTIONS,
+                               "m3u": M3U_SYSTEM_OPTIONS},
             "site": hub.site.as_dict(),
             "prompt": hub.prompt,
         }
