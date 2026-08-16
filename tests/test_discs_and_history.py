@@ -63,7 +63,10 @@ MODE = {"vault": "ok", "drip": False}
 # G * 10 + N, so what was downloaded says exactly which discs were taken.
 # 851 is here so every disc of it can be unticked, which is the only way to
 # make the engine skip a game outright.
-MULTI = {880: 3, 881: 3, 851: 2}
+# One game per section. history.json and vault_cache.json live in a DATA_DIR
+# shared by every hub in this file, so a reused id inherits the previous
+# section's history entry and arrives already cached.
+MULTI = {880: 3, 881: 3, 851: 2, 882: 3, 883: 3, 884: 3}
 
 
 def media_entry(media_id, title, disc):
@@ -185,6 +188,67 @@ with client:
           hub.run_status)
     check("every page fetched exactly once",
           sorted(PAGE_HITS) == [820 + n for n in range(8)], str(sorted(PAGE_HITS)))
+
+# ======================= a disc unticked before Start stays unticked
+print("=== unticking a disc before pressing Start ===")
+# The run reports every page it reaches, cached or not, and rebuilding the
+# disc list from it used to re-tick everything - undoing the choice on
+# screen, and handing every disc back to the next `build_options()`.
+OUT1B = Path(tempfile.mkdtemp(prefix="vimmdh_before_"))
+app1b, hub1b = make_app(OUT1B)
+client1b = TestClient(app1b)
+
+with client1b:
+    reset()
+    client1b.post("/api/queue", json={"text": "882"})     # three discs
+    client1b.post("/api/queue/882/resolve")
+    client1b.post("/api/queue/882/discs", json={"discs": [1, 3]})
+    check("disc 2 is unticked before the run starts",
+          [d["selected"] for d in hub1b.queue_item(882)["discs"]] == [True, False, True],
+          str(hub1b.queue_item(882)["discs"]))
+
+    client1b.post("/api/run/start")
+    check("run finished",
+          wait_for(lambda: hub1b.run_status.startswith("finished"), 180),
+          hub1b.run_status)
+
+    # The game leaves the queue when it finishes, so the surviving evidence
+    # is what was actually fetched.
+    taken = sorted(m for m in MEDIA_HITS if m // 10 == 882)
+    check("only the ticked discs were downloaded", taken == [8821, 8823], str(taken))
+
+print("=== and the choice survives the page being applied again ===")
+# This is the half that really downloaded the wrong files: a second Start,
+# after a Pause or Stop, rebuilds the options from the live queue item.
+OUT1C = Path(tempfile.mkdtemp(prefix="vimmdh_again_"))
+app1c, hub1c = make_app(OUT1C)
+client1c = TestClient(app1c)
+
+with client1c:
+    reset()
+    client1c.post("/api/queue", json={"text": "883"})
+    client1c.post("/api/queue/883/resolve")
+    client1c.post("/api/queue/883/discs", json={"discs": [1, 3]})
+    # Exactly what the run does when it reaches the game.
+    hub1c.apply_page(883, hub1c._pages[883])
+    check("disc 2 is still unticked afterwards",
+          [d["selected"] for d in hub1c.queue_item(883)["discs"]] == [True, False, True],
+          str(hub1c.queue_item(883)["discs"]))
+    check("so a second Start would still skip it",
+          hub1c.disc_overrides().get(883) == [1, 3], str(hub1c.disc_overrides()))
+    check("and the run options rebuild the same way",
+          hub1c.build_options().disc_overrides.get(883) == [1, 3])
+
+print("=== a game nobody touched still defaults to every disc ===")
+with client1c:
+    client1c.post("/api/queue", json={"text": "884"})
+    client1c.post("/api/queue/884/resolve")
+    hub1c.apply_page(884, hub1c._pages[884])
+    check("all three discs selected",
+          all(d["selected"] for d in hub1c.queue_item(884)["discs"]),
+          str(hub1c.queue_item(884)["discs"]))
+    check("and it contributes no override",
+          884 not in hub1c.disc_overrides(), str(hub1c.disc_overrides()))
 
 # ==================================== a disc ticked mid-run is still honoured
 print("=== unticking a disc while an earlier game downloads ===")
