@@ -548,14 +548,37 @@ const SETTING_FIELDS = {
 const FORMAT_FIELDS = { gc: "set-fmt-gc", wii: "set-fmt-wii",
                         xbox: "set-fmt-xbox", ps3: "set-fmt-ps3" };
 
+// The options carry [folder, label] pairs from the server, so the folder
+// names the engine matches on are defined in exactly one place.
+function systemChecklist(id, options, enabled) {
+  const on = (enabled || []).map(s => s.toLowerCase());
+  const box = $(id);
+  box.replaceChildren();
+  for (const [folder, label] of options) {
+    const line = el("label", "checkline");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.dataset.system = folder;
+    input.checked = on.includes(folder.toLowerCase());
+    line.append(input, el("span", null, label));
+    box.append(line);
+  }
+}
+
+function checkedSystems(id) {
+  return [...$(id).querySelectorAll("input:checked")]
+    .map(input => input.dataset.system);
+}
+
 function loadSettingsForm() {
   for (const [key, [id, kind]] of Object.entries(SETTING_FIELDS)) {
     const node = $(id);
     if (kind === "check") node.checked = !!state.settings[key];
     else node.value = state.settings[key] ?? "";
   }
-  $("set-m3usystems").value = (state.settings.m3u_systems || []).join(", ");
-  $("set-chdsystems").value = (state.settings.chd_systems || []).join(", ");
+  const options = state.system_options || { chd: [], m3u: [] };
+  systemChecklist("chd-systems", options.chd, state.settings.chd_systems);
+  systemChecklist("m3u-systems", options.m3u, state.settings.m3u_systems);
   const formats = state.settings.formats || {};
   for (const [system, id] of Object.entries(FORMAT_FIELDS))
     if (formats[system]) $(id).value = formats[system];
@@ -584,9 +607,8 @@ async function saveSettings() {
               : kind === "number" ? Number(node.value)
               : node.value;
   }
-  const csv = (id) => $(id).value.split(",").map(s => s.trim()).filter(Boolean);
-  body.m3u_systems = csv("set-m3usystems");
-  body.chd_systems = csv("set-chdsystems");
+  body.m3u_systems = checkedSystems("m3u-systems");
+  body.chd_systems = checkedSystems("chd-systems");
   body.hidden_tags = [...$("tag-filters").querySelectorAll("input:checked")]
     .map(input => input.dataset.tag);
   body.formats = Object.fromEntries(

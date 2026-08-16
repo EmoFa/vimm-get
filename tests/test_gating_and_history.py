@@ -49,12 +49,17 @@ MATRIX = [
     ("dreamcast",     2,     True,   True),
     ("saturn",        2,     True,   True),
     ("segacd",        2,     True,   True),
-    ("ps2",           1,     False,  False),   # single ISO, nothing to collapse
+    # Nothing to collapse - one ISO - but PCSX2 reads .chd and the saving is
+    # large, so PS2 is compressed via chdman createdvd.
+    ("ps2",           1,     True,   False),
     ("psp",           1,     False,  False),
     ("atarijaguar",   1,     False,  False),   # BigPEmu cannot read CHD
     ("atarijaguarcd", 2,     False,  False),
     ("snes",          1,     False,  False),
+    # Dolphin cannot read CHD (.rvz is the equivalent, offered under formats)
+    # but it does read m3u, so multi-disc GameCube games get a playlist.
     ("gc",            1,     False,  False),
+    ("gc",            2,     False,  True),
     ("ps3",           1,     False,  False),
 ]
 for system, discs, want_chd, want_m3u in MATRIX:

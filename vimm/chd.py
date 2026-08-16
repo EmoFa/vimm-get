@@ -131,6 +131,17 @@ def _download_chdman_windows(progress=None, status=None) -> Path:
 # --------------------------------------------------------------------------
 
 
+# What chdman will take as input here, and which of its subcommands suits
+# each. A cue or gdi describes a CD; a bare .iso from PS2 is a DVD image, and
+# createcd would refuse it.
+CHD_INPUT_SUFFIXES = (".cue", ".gdi", ".iso")
+
+
+def chdman_subcommand(image: Path) -> str:
+    """`createcd` for a cue/gdi sheet, `createdvd` for a bare ISO."""
+    return "createdvd" if Path(image).suffix.lower() == ".iso" else "createcd"
+
+
 def sources_of(sheet: Path) -> list[Path]:
     """The image files a .cue or .gdi sheet references (bin tracks etc.)."""
     text = sheet.read_text(encoding="utf-8", errors="replace")
@@ -165,8 +176,9 @@ def compress_to_chd(sheet: Path, delete_sources: bool = True,
     half-written .chd is removed and sources stay untouched.
     """
     sheet = Path(sheet)
-    if sheet.suffix.lower() not in (".cue", ".gdi"):
-        raise VimmError(f"CHD input must be a .cue or .gdi sheet, got {sheet.name}")
+    if sheet.suffix.lower() not in CHD_INPUT_SUFFIXES:
+        raise VimmError(
+            f"CHD input must be a .cue, .gdi or .iso, got {sheet.name}")
     if not sheet.is_file():
         raise VimmError(f"not found: {sheet}")
 
@@ -175,9 +187,10 @@ def compress_to_chd(sheet: Path, delete_sources: bool = True,
     if out.exists():
         raise VimmError(f"already exists: {out.name}")
 
-    command = [str(chdman), "createcd", "-i", str(sheet), "-o", str(out)]
+    subcommand = chdman_subcommand(sheet)
+    command = [str(chdman), subcommand, "-i", str(sheet), "-o", str(out)]
     if status:
-        status(f"chdman createcd {sheet.name} -> {out.name}")
+        status(f"chdman {subcommand} {sheet.name} -> {out.name}")
 
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -217,16 +230,20 @@ def compress_to_chd(sheet: Path, delete_sources: bool = True,
 
 
 def compressible_among(paths) -> list[Path]:
-    """The .cue/.gdi files in `paths` that don't already have a .chd.
+    """The disc images in `paths` that don't already have a .chd.
 
     Takes an explicit file list rather than a directory: a system folder holds
     every game for that system, so scanning it would sweep up other games'
     discs.
+
+    `.iso` counts as well as the cue/gdi sheets, for the DVD-based systems -
+    only ever reached for systems ticked in the CHD list, and none of the
+    others arrive as an .iso.
     """
     sheets = []
     for raw in paths:
         path = Path(raw)
-        if (path.suffix.lower() in (".cue", ".gdi") and path.is_file()
+        if (path.suffix.lower() in CHD_INPUT_SUFFIXES and path.is_file()
                 and not path.with_suffix(".chd").exists()):
             sheets.append(path)
     return sorted(set(sheets))

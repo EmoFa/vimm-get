@@ -127,7 +127,7 @@
         <input id="set-organize" type="checkbox">
         <span>Sort into a folder per system (snes, psx, ...)</span>
       </label>
-      <label>Preferred regions <span class="hint">affects version choice and search order</span>
+      <label>Preferred regions<span class="help" title="A list in order of preference: the first one that matches wins. Affects which version is downloaded and how search results are sorted.">?</span>
         <input id="set-prefer" type="text" placeholder="USA, Europe, Japan" spellcheck="false">
       </label>
       <div class="row2">
@@ -213,20 +213,16 @@
       <label class="checkline"><input id="set-delchd" type="checkbox">
         <span>Delete bin/cue sources after successful CHD compression</span></label>
       <label class="checkline"><input id="set-waitprocess" type="checkbox">
-        <span>Finish extracting and converting before the next download
-              <span class="hint">for slower drives — USB sticks, SD cards — where
-                downloading and processing at the same time slows both down</span></span></label>
+        <span>Finish extracting and converting before the next download<span
+          class="help" title="For slower drives like USB and SD, where downloading and processing at the same time slows both down.">?</span></span></label>
 
-      <div class="subhead">SYSTEMS</div>
-      <label>CHD compression
-        <span class="hint">folder names whose games arrive as split disc images.
-          PS2/PSP are single ISOs and Jaguar emulators cannot read CHD, so they
-          are left out.</span>
-        <input id="set-chdsystems" type="text" spellcheck="false">
-      </label>
-      <label>m3u playlists <span class="hint">systems whose emulators read m3u</span>
-        <input id="set-m3usystems" type="text" spellcheck="false">
-      </label>
+      <div class="subhead">CHD COMPRESSION<span class="help"
+        title="Systems to convert to .chd. Most are here because their games arrive as split bin+cue or gdi files that CHD collapses into one. PS2 is here because PCSX2 reads .chd and the ISOs are large. Jaguar and GameCube are absent because BigPEmu and Dolphin cannot read CHD.">?</span></div>
+      <div id="chd-systems" class="taglist"></div>
+
+      <div class="subhead">M3U PLAYLISTS<span class="help"
+        title="Systems whose emulators read .m3u playlists for swapping discs. Only multi-disc games get one.">?</span></div>
+      <div id="m3u-systems" class="taglist"></div>
 
       <button id="settings-save" class="accent wide">Save settings</button>
     </div>
