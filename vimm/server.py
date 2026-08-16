@@ -956,14 +956,18 @@ class Hub:
                 # rather than waiting for the whole game to be unpacked.
                 # Scoped to what this job produced, so the sheets of discs
                 # that have not arrived yet are simply not there to submit.
-                if (self.settings.get("auto_compress")
-                        and self.is_chd_system(entry)
-                        and not entry["stages"].get("chd")):
+                # Deliberately not conditioned on the "chd" flag: `produced`
+                # and `compressible_among` already narrow this to sheets that
+                # genuinely need converting, and a flag that wrongly reads
+                # "done" must never be able to skip a disc.
+                if self.settings.get("auto_compress") and self.is_chd_system(entry):
                     self.submit_stage(entry, "chd", only=produced)
-                # Only mark the game extracted once no archive remains.
+                # Extracted once no archive remains *and* every disc has
+                # arrived - "nothing left to unpack" is trivially true after
+                # disc 1 of 2 and means nothing.
                 remaining = [f for f in entry.get("files", [])
                              if Path(f["archive"]).is_file()]
-                if not remaining:
+                if not remaining and self.all_discs_present(entry):
                     entry["stages"]["extracted"] = True
                     stage_completed = True
             elif job.kind == "chd":
@@ -971,9 +975,15 @@ class Hub:
                 # prunes what chdman deleted.
                 produced = job.extra.get("chd")
                 self.track_files(entry, [produced] if produced else [])
-                # A multi-disc game is not converted until every disc is, so
-                # this waits for the last sheet rather than the first.
-                if not chd_mod.compressible_among(self.entry_files(entry)):
+                # "Nothing compressible left" is only meaningful once every
+                # disc is downloaded *and* unpacked. Disc 1's conversion can
+                # finish while disc 2 is still queued behind it for
+                # extraction, and at that instant there is indeed nothing
+                # compressible - because disc 2 is still a .7z. Marking the
+                # game converted there is what left disc 2 as a cue sheet.
+                if (not chd_mod.compressible_among(self.entry_files(entry))
+                        and self.all_discs_present(entry)
+                        and entry["stages"].get("extracted")):
                     entry["stages"]["chd"] = True
                     stage_completed = True
             elif job.kind == "m3u":

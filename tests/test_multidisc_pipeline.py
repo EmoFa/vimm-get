@@ -383,6 +383,123 @@ with client6:
           [f["disc"] for f in entry6["files"]] == [1, 3],
           str([f["disc"] for f in entry6["files"]]))
 
+# ==================== disc 1 converting while disc 2 waits to be extracted
+print("=== disc 1's conversion finishing early must not close the game ===")
+# The reported failure is a race the timing above cannot reach: with real
+# multi-minute transfers, disc 1's CHD job is still running when disc 2
+# finishes downloading, so disc 2's extract job sits behind it. Disc 1's
+# conversion then completes at a moment when nothing compressible exists -
+# because disc 2 is still a .7z - and the game gets flagged converted.
+#
+# Driven here through Hub._on_job_event directly, so it does not depend on
+# how long chdman happens to take.
+from vimm.pipeline import Job
+from vimm.engine import Media, Result, VaultPage
+
+OUT7 = Path(tempfile.mkdtemp(prefix="vimmmd_race_"))
+app7, hub7 = make_app(OUT7)
+RACE = 4247
+DEST = OUT7 / "dreamcast"
+DEST.mkdir(parents=True)
+
+
+def fake_media(disc):
+    return Media(media_id=RACE * 10 + disc, version="1.0", disc=disc,
+                 filename=f"Race Game (USA) (Disc {disc}).cue",
+                 sizes=[100, 0, 0], size_texts=["a", "b", "c"],
+                 formats=["Dreamcast"], crc32=None, md5=None, sha1=None)
+
+
+hub7._pages[RACE] = VaultPage(vault_id=RACE, title="Race Game (Dreamcast)",
+                              download_host="http://x/", media=[fake_media(1),
+                                                                fake_media(2)])
+hub7._opts = hub7.build_options()
+hub7._expected_discs[RACE] = 2
+
+
+def lay_down_disc(disc):
+    """The files an extract job would leave behind, plus its archive."""
+    cue = DEST / f"Race Game (USA) (Disc {disc}).cue"
+    binf = DEST / f"Race Game (USA) (Disc {disc}).bin"
+    binf.write_bytes(os.urandom(2352 * 60))
+    cue.write_text(f'FILE "{binf.name}" BINARY\n  TRACK 01 MODE2/2352\n'
+                   f"    INDEX 01 00:00:00\n")
+    return [str(cue), str(binf)]
+
+
+def record(disc):
+    """What item_done does when a disc finishes downloading."""
+    archive = DEST / f"Race Game (USA) (Disc {disc}).7z"
+    archive.write_bytes(b"archive")
+    return hub7.add_history(Result(RACE, RACE * 10 + disc, archive.name,
+                                   "ok", 7, "CRC ok"))
+
+
+def finish(kind, label, target, item_key, **extra):
+    job = Job(kind=kind, label=label, target=Path(target), item_key=item_key)
+    job.status = "done"
+    job.extra = {**job.extra, **extra}
+    hub7._on_job_event(job)
+
+
+def chd_jobs_for(name):
+    return [j for j in hub7.pipeline.jobs.values()
+            if j.kind == "chd" and Path(j.target).name == name]
+
+
+# 1. disc 1 arrives and is unpacked
+entry7 = record(1)
+d1 = lay_down_disc(1)
+(DEST / "Race Game (USA) (Disc 1).7z").unlink()      # extraction consumes it
+finish("extract", "disc1", DEST / "Race Game (USA) (Disc 1).7z",
+       entry7["key"], extracted=d1)
+check("a conversion is queued for disc 1",
+      len(chd_jobs_for("Race Game (USA) (Disc 1).cue")) == 1,
+      str([j.label for j in hub7.pipeline.jobs.values()]))
+
+# 2. disc 2 finishes downloading while disc 1 is still converting
+record(2)
+check("disc 2 is recorded but not yet unpacked",
+      len(entry7["files"]) == 2 and
+      (DEST / "Race Game (USA) (Disc 2).7z").is_file())
+
+# 3. disc 1's conversion completes - the moment the bug struck
+Path(d1[0]).unlink()                                  # chdman replaces them
+Path(d1[1]).unlink()
+disc1_chd = DEST / "Race Game (USA) (Disc 1).chd"
+disc1_chd.write_bytes(b"chd")
+finish("chd", "disc1", d1[0], entry7["key"], chd=str(disc1_chd))
+
+check("the game is NOT flagged converted while disc 2 is still a .7z",
+      not entry7["stages"].get("chd"), str(entry7["stages"]))
+check("and no playlist has been queued",
+      not any(j.kind == "m3u" for j in hub7.pipeline.jobs.values()),
+      str([j.kind for j in hub7.pipeline.jobs.values()]))
+
+# 4. disc 2 is unpacked
+d2 = lay_down_disc(2)
+(DEST / "Race Game (USA) (Disc 2).7z").unlink()
+finish("extract", "disc2", DEST / "Race Game (USA) (Disc 2).7z",
+       entry7["key"], extracted=d2)
+check("disc 2 gets its own conversion, rather than being skipped",
+      len(chd_jobs_for("Race Game (USA) (Disc 2).cue")) == 1,
+      str([j.label for j in hub7.pipeline.jobs.values() if j.kind == "chd"]))
+check("still no playlist over an unconverted disc",
+      not any(j.kind == "m3u" for j in hub7.pipeline.jobs.values()),
+      str([j.kind for j in hub7.pipeline.jobs.values()]))
+
+# 5. disc 2's conversion completes - only now is the game done
+Path(d2[0]).unlink()
+Path(d2[1]).unlink()
+disc2_chd = DEST / "Race Game (USA) (Disc 2).chd"
+disc2_chd.write_bytes(b"chd")
+finish("chd", "disc2", d2[0], entry7["key"], chd=str(disc2_chd))
+check("now the game is flagged converted", entry7["stages"].get("chd"),
+      str(entry7["stages"]))
+check("and the playlist follows",
+      any(j.kind == "m3u" for j in hub7.pipeline.jobs.values()),
+      str([j.kind for j in hub7.pipeline.jobs.values()]))
+
 server.shutdown()
 print()
 print("FAILURES:", failures if failures else "none")
