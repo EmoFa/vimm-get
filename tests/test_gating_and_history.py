@@ -66,9 +66,17 @@ for system, discs, want_chd, want_m3u in MATRIX:
 check("not extracted yet -> no buttons",
       hub.can_chd(entry("psx", 2, extracted=False, chd=False)) is False
       and hub.can_m3u(entry("psx", 2, extracted=False, chd=False)) is False)
-check("extracted but not compressed -> compress only",
+# A playlist waits for compression only when compression is actually going to
+# happen. With it switched off - as it is by default here - the discs stay as
+# cue sheets and the playlist is built over those instead of never at all.
+check("extracted, compression off -> both offered",
+      hub.can_chd(entry("psx", 2, chd=False)) is True
+      and hub.can_m3u(entry("psx", 2, chd=False)) is True)
+hub.settings["auto_compress"] = True
+check("extracted, compression on and still to do -> compress only",
       hub.can_chd(entry("psx", 2, chd=False)) is True
       and hub.can_m3u(entry("psx", 2, chd=False)) is False)
+hub.settings["auto_compress"] = False
 check("already compressed -> compress no longer offered",
       hub.can_chd(entry("psx", 2, chd=True)) is False)
 
