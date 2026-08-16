@@ -338,14 +338,22 @@ class Hub:
         """Fill in an item's real title, system and disc list from its page."""
         self._pages[vault_id] = page
         opts = self._opts or self.build_options()
+        # Whatever is already ticked stays ticked. This runs again for every
+        # game as the run reaches it - `run_pass` reports the page even when
+        # it came from the cache - so asserting True here would quietly undo
+        # a disc the user unticked before pressing Start.
+        item = self.queue_item(vault_id) or {}
+        picked = {d["disc"]: d.get("selected", True)
+                  for d in (item.get("discs") or [])}
         discs: dict[int, dict] = {}
         for media in page.media:
             # One row per disc; which version is downloaded is decided later
-            # by the engine's preference rules.
+            # by the engine's preference rules. A disc we have not seen
+            # before defaults to selected, so "all" still means all.
             discs.setdefault(media.disc, {
                 "disc": media.disc,
                 "size_text": media.size_text(0),
-                "selected": True,
+                "selected": picked.get(media.disc, True),
             })
         disc_list = [discs[d] for d in sorted(discs)]
         title = page.title
