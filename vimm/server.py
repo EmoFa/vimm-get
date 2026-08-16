@@ -77,6 +77,12 @@ DEFAULT_SETTINGS = {
     "auto_extract": False,
     "auto_compress": False,
     "auto_m3u": False,
+    # Hold the next download until extraction and conversion have finished.
+    # Off by default: on a normal disk the overlap is free and finishes
+    # sooner. It is for drives that can only manage one stream at a time -
+    # measured on a USB flash drive, a second writer cost 74% of the
+    # download's throughput and produced stalls of over three seconds.
+    "wait_for_processing": False,
     "m3u_systems": DEFAULT_M3U_SYSTEMS,
     "chd_systems": DEFAULT_CHD_SYSTEMS,
     "hidden_tags": search_mod.DEFAULT_HIDDEN_TAGS,
@@ -1101,6 +1107,24 @@ class WebListener(Listener):
 
     def progress_done(self, text):
         self.hub.log(f"  {text}")
+
+    def before_download(self):
+        """Hold the transfer back until the pipeline is quiet, if asked to.
+
+        Only for drives that cannot do two things at once. Watches the run's
+        cancel event as well, so Pause and Stop are never stuck behind a
+        conversion that has minutes left to run.
+        """
+        if not self.hub.settings.get("wait_for_processing"):
+            return
+        if self.hub.pipeline.idle():
+            return
+        self.hub.log("  waiting for extraction/conversion to finish "
+                     "before the next download")
+        while not self.hub._cancel.is_set():
+            if self.hub.pipeline.idle():
+                return
+            self.hub._cancel.wait(0.25)
 
     def item_plan(self, vault_id: int, downloads: int):
         self._plan[vault_id] = {"left": downloads, "failed": 0}

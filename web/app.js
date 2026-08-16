@@ -541,6 +541,7 @@ const SETTING_FIELDS = {
   auto_compress: ["set-autocompress", "check"],
   auto_m3u: ["set-autom3u", "check"],
   delete_chd_sources: ["set-delchd", "check"],
+  wait_for_processing: ["set-waitprocess", "check"],
 };
 
 // Per-system download format, keyed by the folder name the server uses.
