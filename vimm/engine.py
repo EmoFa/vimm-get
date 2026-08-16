@@ -223,6 +223,14 @@ class Listener:
 
     def page_resolved(self, page: VaultPage) -> None: ...
 
+    def before_download(self) -> None:
+        """A chance for the front-end to hold the run back.
+
+        Called immediately before each transfer, so a front-end that wants
+        downloads and post-processing kept apart can block here. Returns at
+        once by default; the engine knows nothing about what it waits for.
+        """
+
     def item_plan(self, vault_id: int, downloads: int) -> None:
         """How many files this game will produce - one per chosen disc.
 
@@ -1394,6 +1402,10 @@ def run_pass(
                 reason = (NEXT_DISC_WAIT if disc_index > 0
                           else "being polite between downloads")
                 client._sleep(delay, reason)
+
+            # Per disc, not just per game: on a slow drive the point is that
+            # disc 1's extraction is finished before disc 2 starts arriving.
+            listener.before_download()
 
             try:
                 result = client.download(page, media, alt, dest_dir)

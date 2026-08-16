@@ -47,9 +47,25 @@ class PipelineWorker:
         self.on_event = on_event or (lambda job: None)
         self.jobs: dict[str, Job] = {}
         self._queue: queue.Queue[Job] = queue.Queue()
+        # Set only while the worker is parked waiting for something to do.
+        self._parked = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="pipeline")
         self._thread.start()
+
+    def idle(self) -> bool:
+        """True when there is genuinely no post-processing left to do.
+
+        The parked flag is the load-bearing half. Job statuses alone are not
+        enough: `_run` marks a job done a moment *before* emitting the event
+        that queues the next stage, so mid-chain there is a window with
+        nothing queued or running and a conversion about to start. Because
+        `on_event` runs synchronously on the worker thread, the worker cannot
+        park until that chaining has happened - so waiting for it to park is
+        what makes this exact rather than approximate.
+        """
+        return self._parked.is_set() and not any(
+            job.status in ("queued", "running") for job in self.jobs.values())
 
     def submit(self, job: Job) -> Job | None:
         """Queue a job, unless the same work is already pending.
@@ -89,7 +105,9 @@ class PipelineWorker:
 
     def _run(self) -> None:
         while True:
+            self._parked.set()
             job = self._queue.get()
+            self._parked.clear()
             job.status = "running"
             self._emit(job)
             try:
