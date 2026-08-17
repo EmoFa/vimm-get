@@ -1,0 +1,29 @@
+# This file belongs in the repository. It is shared by everyone who clones
+# it, which is the point: the rules below protect anyone running the app,
+# not just this machine. For rules that should apply only to your own copy,
+# use .git/info/exclude instead - that one lives inside .git and is never
+# pushed.
+
+# Never commit a session cookie - it is a login to your account.
+cookies.txt
+*.cookies
+
+# App state and downloaded tools (chdman lands in tools/)
+data/
+tools/
+
+# Downloaded games and partial transfers
+*.part
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+.claude/
