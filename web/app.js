@@ -147,12 +147,23 @@ function discPicker(item) {
   if (discs.length < 2) return null;
   const row = el("div", "discs");
   row.append(el("span", "disc-label", `${discs.length} DISCS`));
+  // A disc can be changed unless the run is working on this game right now,
+  // or the disc is already on disk. Pause and the upcoming ones open up -
+  // including one the run has gone past, which Start picks up.
+  const busy = ["downloading", "working", "waiting"].includes(item.status);
   for (const disc of discs) {
-    const chip = el("label", "disc-chip" + (disc.selected ? " on" : ""));
+    const why = busy ? "pause to change this game's discs"
+              : disc.done ? "already downloaded"
+              : disc.active ? "partly downloaded - resumes on Start"
+              : "";
+    const locked = Boolean(why);
+    const chip = el("label", "disc-chip" + (disc.selected ? " on" : "")
+                             + (locked ? " locked" : ""));
+    if (why) chip.title = why;
     const box = document.createElement("input");
     box.type = "checkbox";
     box.checked = disc.selected;
-    box.disabled = ["downloading", "working", "waiting"].includes(item.status);
+    box.disabled = locked;
     box.onchange = () => {
       disc.selected = box.checked;
       chip.classList.toggle("on", box.checked);
@@ -169,7 +180,9 @@ function discPicker(item) {
         });
     };
     chip.append(box, el("span", null, `Disc ${disc.disc}`));
-    if (disc.size_text) chip.append(el("span", "disc-label", disc.size_text));
+    if (disc.done) chip.append(el("span", "disc-label", "DONE"));
+    else if (disc.active) chip.append(el("span", "disc-label", "PART"));
+    else if (disc.size_text) chip.append(el("span", "disc-label", disc.size_text));
     row.append(chip);
   }
   return row;

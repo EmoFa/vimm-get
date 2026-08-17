@@ -66,7 +66,8 @@ MODE = {"vault": "ok", "drip": False}
 # One game per section. history.json and vault_cache.json live in a DATA_DIR
 # shared by every hub in this file, so a reused id inherits the previous
 # section's history entry and arrives already cached.
-MULTI = {880: 3, 881: 3, 851: 2, 882: 3, 883: 3, 884: 3}
+MULTI = {880: 3, 881: 3, 851: 2, 882: 3, 883: 3, 884: 3, 885: 3, 886: 3,
+         887: 3}
 
 
 def media_entry(media_id, title, disc):
@@ -416,6 +417,147 @@ with client6:
     check("and it cost no page view", PAGE_HITS == [], str(PAGE_HITS))
     check("but it is not treated as a choice the user made",
           not item.get("chosen"), str(item.get("chosen")))
+
+# ================== which discs you may change, and which are settled
+print("=== a disc on disk cannot be unticked; the rest are free ===")
+# Disc 1 finished, disc 2 left part-downloaded, disc 3 untouched - exactly
+# the state a paused multi-disc game is in.
+OUT8 = Path(tempfile.mkdtemp(prefix="vimmdh_lock_"))
+app8, hub8 = make_app(OUT8)
+client8 = TestClient(app8)
+
+with client8:
+    reset()
+    client8.post("/api/queue", json={"text": "885"})
+    client8.post("/api/queue/885/resolve")
+    # Named as the media are, which is how find_download recognises a file
+    # as belonging to a disc.
+    (OUT8 / "Game 885 (USA) (Disc 1).zip").write_bytes(b"finished")
+    (OUT8 / "Game 885 (USA) (Disc 2).zip.part").write_bytes(b"halfway")
+    hub8.queue_item(885)["status"] = "paused"
+    hub8.refresh_disc_states(885)
+
+    states = [(d["disc"], d.get("done"), d.get("active"))
+              for d in hub8.queue_item(885)["discs"]]
+    check("disc 1 reads as done", states[0] == (1, True, False), str(states))
+    check("disc 2 reads as part-downloaded", states[1] == (2, False, True),
+          str(states))
+    check("disc 3 is free", states[2] == (3, False, False), str(states))
+
+    r = client8.post("/api/queue/885/discs", json={"discs": [1, 2]})
+    check("unticking the untouched disc is allowed", r.status_code == 200,
+          str(r.status_code))
+
+    r = client8.post("/api/queue/885/discs", json={"discs": [2]})
+    check("unticking the finished disc is refused", r.status_code == 409,
+          str(r.status_code))
+    check("and says it is already downloaded",
+          "already been downloaded" in r.json().get("error", ""), str(r.json()))
+
+    r = client8.post("/api/queue/885/discs", json={"discs": [1]})
+    check("unticking the part-downloaded disc is refused", r.status_code == 409,
+          str(r.status_code))
+    check("and says it resumes on Start",
+          "resumes on Start" in r.json().get("error", ""), str(r.json()))
+
+    check("the refusals changed nothing",
+          [d["selected"] for d in hub8.queue_item(885)["discs"]]
+          == [True, True, False],
+          str([d["selected"] for d in hub8.queue_item(885)["discs"]]))
+
+print("=== a finished disc stays locked once the row goes back to queued ===")
+with client8:
+    hub8.queue_item(885)["status"] = "queued"
+    hub8.refresh_disc_states(885)
+    r = client8.post("/api/queue/885/discs", json={"discs": [2, 3]})
+    check("still refused when merely queued", r.status_code == 409,
+          str(r.status_code))
+
+print("=== and stays locked after extraction takes the archive away ===")
+with client8:
+    # find_download only recognises an archive, so once the .zip is unpacked
+    # and deleted the disc would read as free again unless history is
+    # consulted too. This is the case that nearly slipped through.
+    (OUT8 / "Game 885 (USA) (Disc 1).zip").unlink()
+    hub8.history.insert(0, {
+        "key": "k885", "vault_id": 885, "title": "Game 885 (PS1)",
+        "system_folder": "psx", "dir": str(OUT8), "stages": {},
+        "files": [{"filename": "Game 885 (USA) (Disc 1).zip",
+                   "archive": str(OUT8 / "Game 885 (USA) (Disc 1).zip"),
+                   "bytes": 8, "disc": 1, "message": ""}],
+    })
+    hub8.refresh_disc_states(885)
+    check("history still marks disc 1 as downloaded",
+          hub8.queue_item(885)["discs"][0].get("done") is True,
+          str(hub8.queue_item(885)["discs"][0]))
+    r = client8.post("/api/queue/885/discs", json={"discs": [2, 3]})
+    check("so unticking it is still refused", r.status_code == 409,
+          str(r.status_code))
+
+# ============ Nolan's second case: add a disc the run has already gone past
+print("=== pausing to add disc 1 after starting with only 2 and 3 ===")
+OUT9 = Path(tempfile.mkdtemp(prefix="vimmdh_add1_"))
+app9, hub9 = make_app(OUT9)
+client9 = TestClient(app9)
+MODE["drip"] = True
+
+with client9:
+    reset()
+    client9.post("/api/queue", json={"text": "886"})
+    client9.post("/api/queue/886/resolve")
+    client9.post("/api/queue/886/discs", json={"discs": [2, 3]})
+    client9.post("/api/run/start")
+    check("it starts on disc 2, disc 1 having been skipped",
+          wait_for(lambda: any(m // 10 == 886 for m in MEDIA_HITS), 30),
+          str(MEDIA_HITS))
+
+    client9.post("/api/run/pause")
+    wait_for(lambda: not hub9.run_status.endswith("ing"), 30)
+    MODE["drip"] = False
+
+    # Disc 1 was never fetched, so it must still be free to tick.
+    disc1 = hub9.queue_item(886)["discs"][0]
+    check("disc 1 is neither done nor part-downloaded",
+          not disc1.get("done") and not disc1.get("active"), str(disc1))
+    r = client9.post("/api/queue/886/discs", json={"discs": [1, 2, 3]})
+    check("adding it is allowed", r.status_code == 200, str(r.status_code))
+
+    before = list(MEDIA_HITS)
+    client9.post("/api/run/start")
+    check("run finished", wait_for(
+        lambda: hub9.run_status.startswith("finished"), 180), hub9.run_status)
+    fetched_after = [m for m in MEDIA_HITS[len(before):] if m // 10 == 886]
+    check("disc 1 was fetched on the second pass", 8861 in fetched_after,
+          str(fetched_after))
+    check("all three discs are on disk",
+          sorted(p.name for p in OUT9.glob("Game 886*.zip"))
+          == ["Game 8861 (USA).zip", "Game 8862 (USA).zip",
+              "Game 8863 (USA).zip"],
+          str(sorted(p.name for p in OUT9.glob("Game 886*.zip"))))
+
+MODE["drip"] = False
+
+print("=== a game being downloaded right now is still untouchable ===")
+OUT10 = Path(tempfile.mkdtemp(prefix="vimmdh_busy_"))
+app10, hub10 = make_app(OUT10)
+client10 = TestClient(app10)
+MODE["drip"] = True
+
+with client10:
+    reset()
+    client10.post("/api/queue", json={"text": "887"})
+    client10.post("/api/run/start")
+    check("downloading", wait_for(
+        lambda: (hub10.queue_item(887) or {}).get("status") == "downloading", 30))
+    r = client10.post("/api/queue/887/discs", json={"discs": [1]})
+    check("changing its discs mid-transfer is refused", r.status_code == 409,
+          str(r.status_code))
+    check("and says to wait", "too late" in r.json().get("error", ""),
+          str(r.json()))
+    client10.post("/api/run/stop")
+    wait_for(lambda: not hub10.run_status.endswith("ing"), 30)
+
+MODE["drip"] = False
 
 server.shutdown()
 print()
