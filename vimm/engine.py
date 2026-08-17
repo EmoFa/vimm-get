@@ -1339,6 +1339,28 @@ def destination_for(
     return root / system_folder(page.title, getattr(opts, "folders", None), warn=warn)
 
 
+def resume_first(selections, dest_dir: Path):
+    """Discs already part-downloaded, then the rest in their existing order.
+
+    `select_media` returns discs in ascending order, which is right for a
+    game being started and wrong for one already under way. Add disc 1 to a
+    game whose disc 2 is half fetched and disc 1 sorts first, so the run
+    begins it from scratch and leaves disc 2's `.part` untouched until much
+    later. Finishing what is already started is both the obvious behaviour
+    and what stops a partial file lingering across another whole download.
+
+    Partials are found the same way the download path names them, so the two
+    cannot disagree about which file belongs to which disc.
+    """
+    started, fresh = [], []
+    for media, alt in selections:
+        stem = safe_filename(Path(media.filename).stem, f"media-{media.media_id}")
+        bucket = (started if find_download(dest_dir, stem, partial=True)
+                  else fresh)
+        bucket.append((media, alt))
+    return started + fresh
+
+
 def run_pass(
     vault_ids: list[int],
     opts: argparse.Namespace,
@@ -1385,6 +1407,7 @@ def run_pass(
 
         listener.item_plan(vault_id, len(selections))
         dest_dir = destination_for(page, opts, listener)
+        selections = resume_first(selections, dest_dir)
         for disc_index, (media, alt) in enumerate(selections):
             if opts.list:
                 listener.would_get(media, alt, dest_dir)
