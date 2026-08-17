@@ -67,7 +67,8 @@ MODE = {"vault": "ok", "drip": False}
 # shared by every hub in this file, so a reused id inherits the previous
 # section's history entry and arrives already cached.
 MULTI = {880: 3, 881: 3, 851: 2, 882: 3, 883: 3, 884: 3, 885: 3, 886: 3,
-         887: 3}
+         887: 3, 888: 2}
+RANGE_HITS: list[tuple[int, int]] = []
 
 
 def media_entry(media_id, title, disc):
@@ -131,6 +132,8 @@ class Handler(BaseHTTPRequestHandler):
         start = 0
         if self.headers.get("Range"):
             start = int(self.headers["Range"].split("=")[1].split("-")[0])
+        # Where each request began, so a test can tell a resume from a restart.
+        RANGE_HITS.append((media_id, start))
         body = ZIP[start:]
         self.send_response(206 if start else 200)
         if start:
@@ -139,8 +142,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes")
+        # Named from the same title the media list advertises, as the real
+        # site does. They used to differ here, which quietly meant a resumed
+        # download could never find its own .part - the planned name and the
+        # delivered name never matched - so nothing that depends on knowing
+        # which file belongs to which disc could be tested honestly.
+        vault_id, disc = media_id // 10, media_id % 10
+        name = (f"Game {vault_id} (USA) (Disc {disc}).zip"
+                if vault_id in MULTI else f"Game {media_id} (USA).zip")
         self.send_header("Content-Disposition",
-                         f'attachment; filename="Game {media_id} (USA).zip"')
+                         f'attachment; filename="{name}"')
         self.end_headers()
         if MODE["drip"]:
             for i in range(0, len(body), 16384):
@@ -168,6 +179,7 @@ def make_app(out_dir):
 def reset():
     PAGE_HITS.clear()
     MEDIA_HITS.clear()
+    RANGE_HITS.clear()
 
 
 # ================= the run looks each game up as it reaches it, once each
@@ -531,8 +543,8 @@ with client9:
           str(fetched_after))
     check("all three discs are on disk",
           sorted(p.name for p in OUT9.glob("Game 886*.zip"))
-          == ["Game 8861 (USA).zip", "Game 8862 (USA).zip",
-              "Game 8863 (USA).zip"],
+          == ["Game 886 (USA) (Disc 1).zip", "Game 886 (USA) (Disc 2).zip",
+              "Game 886 (USA) (Disc 3).zip"],
           str(sorted(p.name for p in OUT9.glob("Game 886*.zip"))))
 
 MODE["drip"] = False
@@ -558,6 +570,72 @@ with client10:
     wait_for(lambda: not hub10.run_status.endswith("ing"), 30)
 
 MODE["drip"] = False
+
+# ============ a disc added to a game already under way goes after it
+print("=== a half-fetched disc finishes before a newly added one starts ===")
+# Start with only disc 2, pause it part-way, then add disc 1. Ascending order
+# would send the run back to disc 1 from scratch and leave disc 2's .part
+# sitting there for the length of another download.
+OUT11 = Path(tempfile.mkdtemp(prefix="vimmdh_resume_"))
+app11, hub11 = make_app(OUT11)
+client11 = TestClient(app11)
+MODE["drip"] = True
+
+with client11:
+    reset()
+    client11.post("/api/queue", json={"text": "888"})
+    client11.post("/api/queue/888/resolve")
+    client11.post("/api/queue/888/discs", json={"discs": [2]})
+    client11.post("/api/run/start")
+    check("disc 2 starts", wait_for(
+        lambda: any(m == 8882 for m in MEDIA_HITS), 30), str(MEDIA_HITS))
+    time.sleep(0.5)          # let some of it land on disk
+
+    client11.post("/api/run/pause")
+    wait_for(lambda: not hub11.run_status.endswith("ing"), 30)
+    MODE["drip"] = False
+    check("disc 2 is part-downloaded",
+          list(OUT11.glob("Game 888*(Disc 2)*.part"))
+          or list(OUT11.glob("*.part")),
+          str(list(OUT11.glob("*"))))
+
+    r = client11.post("/api/queue/888/discs", json={"discs": [1, 2]})
+    check("adding disc 1 is allowed", r.status_code == 200, str(r.json()))
+
+    reset()
+    client11.post("/api/run/start")
+    check("run finished", wait_for(
+        lambda: hub11.run_status.startswith("finished"), 180), hub11.run_status)
+
+    order = [m for m in MEDIA_HITS if m // 10 == 888]
+    check("disc 2 is resumed before disc 1 is begun",
+          order and order[0] == 8882, str(order))
+    check("and disc 1 follows it", 8881 in order[1:], str(order))
+
+    resumed = [start for mid, start in RANGE_HITS if mid == 8882]
+    check("disc 2 continued from where it stopped rather than restarting",
+          any(s > 0 for s in resumed), str(resumed))
+
+    check("both files are complete and correct",
+          (OUT11 / "Game 888 (USA) (Disc 1).zip").read_bytes() == ZIP
+          and (OUT11 / "Game 888 (USA) (Disc 2).zip").read_bytes() == ZIP)
+    check("no partial left behind", list(OUT11.glob("*.part")) == [],
+          str(list(OUT11.glob("*.part"))))
+
+MODE["drip"] = False
+
+print("=== an ordinary game is still fetched in disc order ===")
+OUT12 = Path(tempfile.mkdtemp(prefix="vimmdh_plain_"))
+app12, hub12 = make_app(OUT12)
+client12 = TestClient(app12)
+with client12:
+    reset()
+    client12.post("/api/queue", json={"text": "884"})
+    client12.post("/api/run/start")
+    wait_for(lambda: hub12.run_status.startswith("finished"), 180)
+    order = [m for m in MEDIA_HITS if m // 10 == 884]
+    check("nothing part-downloaded means nothing is reordered",
+          order == [8841, 8842, 8843], str(order))
 
 server.shutdown()
 print()
